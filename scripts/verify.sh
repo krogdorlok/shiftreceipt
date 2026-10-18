@@ -8,7 +8,7 @@ ROUND=$(( $(git log --oneline "$BASE"..HEAD | grep -c "$M: fix round") + 1 ))
 PROMPT="$(cat prompts/verify.md)
 Milestone: $M. Round: $ROUND. Spec: prompts/$M.md. Diff to review: git diff $BASE..HEAD"
 command -v codex >/dev/null || { echo "codex not installed"; exit 2; }
-codex exec -s workspace-write "$PROMPT" > .codex_last.log 2>&1 || { echo "codex failed, see .codex_last.log"; tail -20 .codex_last.log; exit 2; }
+codex exec -s workspace-write "$PROMPT" < /dev/null > .codex_last.log 2>&1 || { echo "codex failed, see .codex_last.log"; tail -20 .codex_last.log; exit 2; }
 # Enforce the verifier's write scope: revert edits outside REVIEW.md and tests/review/.
 BAD=$(git diff --name-only | grep -vE '^(REVIEW\.md|tests/review/)' || true)
 if [ -n "$BAD" ]; then echo "Reverting Codex edits outside its scope:"; echo "$BAD"; echo "$BAD" | xargs git checkout -- ; fi
