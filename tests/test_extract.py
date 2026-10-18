@@ -19,7 +19,7 @@ def fake(*results):
     """Each result is a JSON string to return or an exception to raise, in call order."""
     calls = []
 
-    def g(data, mime, prompt):
+    def g(data, mime, prompt, model=None):
         calls.append(prompt)
         r = results[len(calls) - 1]
         if isinstance(r, BaseException):
@@ -135,3 +135,30 @@ def test_gemini_falls_back_to_interactions(monkeypatch):
 def test_duplicate_rows_collapse(monkeypatch):
     (shifts, warns), _ = run(monkeypatch, J(row(), row()))
     assert len(shifts) == 1 and warns == []
+
+
+class Quota(Exception):
+    code = 429
+
+
+def test_quota_moves_to_next_model(monkeypatch):
+    used = []
+
+    def g(data, mime, prompt, model=None):
+        used.append(model)
+        if len(used) == 1:
+            raise Quota()
+        return J(row())
+    monkeypatch.setenv("GEMINI_MODEL", "m1")
+    monkeypatch.setenv("GEMINI_FALLBACKS", "m2,m3")
+    monkeypatch.setattr(ex, "_gemini", g)
+    shifts, warns = ex.extract(b"i", "image/png", "Maria Lopez", REF)
+    assert len(shifts) == 1 and used == ["m1", "m2"]
+
+
+def test_all_models_out_of_quota_is_busy(monkeypatch):
+    def g(data, mime, prompt, model=None):
+        raise Quota()
+    monkeypatch.setenv("GEMINI_FALLBACKS", "m2")
+    monkeypatch.setattr(ex, "_gemini", g)
+    assert ex.extract(b"i", "image/png", "Maria Lopez", REF) == ([], ["busy"])

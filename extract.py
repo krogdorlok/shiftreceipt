@@ -48,11 +48,17 @@ class Extraction(BaseModel):
     shifts: list[Row]
 
 
-def _gemini(data: bytes, mime: str, prompt: str) -> str:
+def _models() -> list[str]:
+    """GEMINI_MODEL first, then fallbacks: each model has its own free-tier quota."""
+    first = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
+    rest = (os.getenv("GEMINI_FALLBACKS") or "gemini-3.7-flash,gemini-3.5-flash,gemini-2.5-flash").split(",")
+    return list(dict.fromkeys([first] + [m.strip() for m in rest if m.strip()]))
+
+
+def _gemini(data: bytes, mime: str, prompt: str, model: str = "gemini-3.8-flash") -> str:
     # SDK-internal retries off: extract() does exactly one retry itself
     client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"), http_options=types.HttpOptions(
         timeout=TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=1)))
-    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     try:
         return client.models.generate_content(
             model=model, contents=[types.Part.from_bytes(data=data, mime_type=mime), prompt],
@@ -108,17 +114,32 @@ def _post(rows: list[Row], ref_date: date) -> tuple[list[Shift], list[str]]:
 LOG = logging.getLogger("shiftreceipt")
 
 
+def _out_of_quota(e: Exception) -> bool:
+    """429 (quota used up) or 404 (model not available to this key): try the next model."""
+    return (getattr(e, "code", None) or getattr(e, "status_code", None)) in (429, 404)
+
+
 def extract(image_bytes: bytes, mime: str, worker_name: str, ref_date: date) -> tuple[list[Shift], list[str]]:
+    """Warnings: ["unreadable"] = not a schedule or failed; ["busy"] = every model is out of quota."""
     prompt = PROMPT.format(name=" ".join(worker_name.split())[:80])
     try:
-        for attempt in range(2):
-            try:
-                text = _gemini(image_bytes, mime, prompt)
+        text = None
+        for model in _models():
+            for attempt in range(2):
+                try:
+                    text = _gemini(image_bytes, mime, prompt, model)
+                    break
+                except Exception as e:
+                    LOG.warning(f"extract: {model} attempt {attempt + 1} failed: {type(e).__name__} "
+                                f"{getattr(e, 'code', '')} {getattr(e, 'status', '')}")
+                    if _out_of_quota(e):
+                        break  # next model
+                    if attempt or not _retryable(e):
+                        return [], ["unreadable"]
+            if text is not None:
                 break
-            except Exception as e:
-                LOG.warning(f"extract: gemini attempt {attempt + 1} failed: {type(e).__name__}")
-                if attempt or not _retryable(e):
-                    return [], ["unreadable"]
+        if text is None:
+            return [], ["busy"]
         rows = Extraction.model_validate_json(text or "").shifts
         shifts, warnings = _post(rows, ref_date) if rows else ([], ["unreadable"])  # no rows: not a schedule
         LOG.warning(f"extract: {len(image_bytes) // 1024} KB {mime}: {len(rows)} rows from gemini, "

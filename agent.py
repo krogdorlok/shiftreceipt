@@ -400,6 +400,9 @@ def handle_image(sender: str, data: bytes, mime: str) -> list[str]:
         PENDING_IMAGES[sender].append((data, mime, sha))
         return ["I will read it once you are set up.\n" + _setup_prompt(_missing(profile))]
     shifts, warnings = extract(data, mime, profile["name"], _today())
+    if warnings == ["busy"]:
+        return ["Reading screenshots is over its limit right now. Please type your schedule instead (same result):"
+                "\n\n" + SCHEDULE_EXAMPLE]
     if not shifts:
         return [f"I could not read any shifts for {profile['name']} in that image. You can type your schedule "
                 "instead:\n\n" + SCHEDULE_EXAMPLE]
