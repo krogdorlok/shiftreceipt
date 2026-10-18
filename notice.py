@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from pypdf import PdfReader, PdfWriter
-from PIL import Image, ImageChops, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 from pypdf import PageObject
 from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject, NameObject, NumberObject,
                            TextStringObject)
@@ -39,36 +39,122 @@ def _description(lines: list[dict], note: str) -> str:
     return "\n".join(out + ([note] if note else []))  # one item per line in a multiline field
 
 
+def _profile(mask: Image.Image, axis: int) -> list[int]:
+    """Mean ink per column (axis 0) or per row (axis 1), 0-255, via a box-filter resize."""
+    w, h = mask.size
+    return list(mask.resize((w, 1) if axis == 0 else (1, h), Image.BOX).tobytes())
+
+
+def _ink_clusters(core: Image.Image, cell: int = 12, reach: int = 3) -> list[set]:
+    """Ink grouped into clusters on a grid of cell x cell pixels. A cell is ink if enough of it is inked, so lone
+    specks never count; cells within `reach` cells join one cluster (letters, a gap between names, an i-dot)."""
+    gw, gh = -(-core.width // cell), -(-core.height // cell)
+    dens = core.resize((gw, gh), Image.BOX).tobytes()
+    cells = {(i % gw, i // gw) for i, v in enumerate(dens) if v > 20}
+    clusters, seen = [], set()
+    for start in cells:
+        if start in seen:
+            continue
+        seen.add(start)
+        todo, group = [start], set()
+        while todo:
+            x, y = todo.pop()
+            group.add((x, y))
+            for dx in range(-reach, reach + 1):
+                for dy in range(-reach, reach + 1):
+                    n = (x + dx, y + dy)
+                    if n in cells and n not in seen:
+                        seen.add(n)
+                        todo.append(n)
+        clusters.append(group)
+    return sorted(clusters, key=len, reverse=True)
+
+
+def _is_line(cluster: set) -> bool:
+    """A long, thin, straight cluster (2 cells or less across, 12+ long) is an edge or a ruled line, not writing."""
+    xs, ys = [x for x, _ in cluster], [y for _, y in cluster]
+    w, h = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+    return min(w, h) <= 2 and max(w, h) >= 12
+
+
+def _remove_ruled_lines(alpha: Image.Image, diff: Image.Image) -> Image.Image:
+    """Erase rows (and margin columns) inked across half the photo. Inside such a line only pixels clearly darker
+    than the line itself survive: pen ink is darker than printed ruling, so strokes crossing the line stay whole."""
+    W, H = alpha.size
+    for axis in (1, 0):
+        for i, v in enumerate(_profile(alpha, axis)):
+            if v <= 128:
+                continue
+            line = sorted(diff.crop((0, i, W, i + 1) if axis == 1 else (i, 0, i + 1, H)).tobytes())
+            level = line[len(line) // 2]  # how dark the printed line is
+            band = (0, max(i - 3, 0), W, min(i + 4, H)) if axis == 1 else (max(i - 3, 0), 0, min(i + 4, W), H)
+            keep = diff.crop(band).point(lambda d: 255 if d > level + 35 else 0)
+            alpha.paste(ImageChops.multiply(alpha.crop(band), keep), band)
+    return alpha
+
+
 def clean_signature(photo: bytes) -> bytes:
-    """Photo of a handwritten signature -> PNG with only the ink, transparent background, cropped.
-    The paper's brightness (shadows included) is estimated with a wide blur; ink is what is darker than it.
+    """Photo of a handwritten signature -> PNG with only the ink, transparent background, tightly cropped.
+    Ink = darker than the local paper brightness (a wide blur), so shadows do not count. Ignored: the photo border
+    (table edges), ruled paper lines, specks, and marks far from the signature.
     Raises ValueError if the photo does not look like a signature."""
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(photo))).convert("L")
     img.thumbnail((1600, 1600))
-    paper = img.filter(ImageFilter.GaussianBlur(max(img.size) // 30 or 1))
-    ink = ImageChops.subtract(paper, img)                      # 0 on paper, high on ink
-    alpha = ink.point(lambda v: 0 if v < 25 else 255 if v > 60 else (v - 25) * 255 // 35)
-    share = sum(alpha.histogram()[128:]) / (alpha.size[0] * alpha.size[1])
-    box = alpha.getbbox()
-    if not box or not 0.002 <= share <= 0.25 or (box[2] - box[0]) < 40:
+    W, H = img.size
+    paper = img.filter(ImageFilter.GaussianBlur(max(W, H) // 30 or 1))
+    diff = ImageChops.subtract(paper, img)  # how much darker than the paper around it
+    alpha = diff.point(lambda v: 0 if v < 25 else 255 if v > 60 else (v - 25) * 255 // 35)
+    m = max(W, H) // 25  # photo border: table, fingers, page edge
+    edge = Image.new("L", (W, H), 0)
+    edge.paste(255, (m, m, W - m, H - m))
+    alpha = _remove_ruled_lines(ImageChops.multiply(alpha, edge), diff)
+    core = alpha.point(lambda v: 255 if v > 128 else 0).filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(5))
+    draw = ImageDraw.Draw(core)
+    for blob in _ink_clusters(core, cell=4, reach=1):  # specks: tiny isolated blobs, unlike long pen strokes
+        if len(blob) <= 6:
+            for x, y in blob:
+                draw.rectangle((x * 4, y * 4, x * 4 + 3, y * 4 + 3), fill=0)
+    clusters = [c for c in _ink_clusters(core) if not _is_line(c)]  # paper edges, ruling, a long underline
+    if not clusters:
         raise ValueError("no signature found")
-    if box[3] - box[1] > box[2] - box[0]:  # signatures are wide; a tall block of ink is a page of text, not a signature
+    keep = [c for c in clusters if len(c) >= 0.2 * len(clusters[0])]  # the signature, not specks or stray marks
+    if len(keep) > 4:
+        raise ValueError("looks like text, not a signature")
+    cells = set().union(*keep)
+    cell = 12
+    rows = sorted({y for _, y in cells})
+    bands = 1 + sum(1 for a, b in zip(rows, rows[1:]) if b - a > 2)
+    if bands >= 3:  # lines of text stacked with gaps; a signature is one band
+        raise ValueError("looks like text, not a signature")
+    x0, x1 = min(x for x, _ in cells) * cell, (max(x for x, _ in cells) + 1) * cell
+    y0, y1 = min(y for _, y in cells) * cell, (max(y for _, y in cells) + 1) * cell
+    if x1 - x0 < 60 or len(cells) < 6:
+        raise ValueError("no signature found")
+    if (x1 - x0) / (y1 - y0) < 1.0:  # a signature is wider than tall; a page of text is not
         raise ValueError("does not look like a signature")
-    pad = 8
-    box = (max(box[0] - pad, 0), max(box[1] - pad, 0), min(box[2] + pad, img.size[0]), min(box[3] + pad, img.size[1]))
+    mask = Image.new("L", (W, H), 0)
+    draw = ImageDraw.Draw(mask)
+    for x, y in cells:
+        draw.rectangle((x * cell - cell, y * cell - cell, (x + 2) * cell, (y + 2) * cell), fill=255)
+    clean = ImageChops.multiply(ImageChops.multiply(alpha, mask), core.filter(ImageFilter.MaxFilter(3)))  # no specks
+    box = clean.point(lambda v: 255 if v > 40 else 0).getbbox() or (x0, y0, x1, y1)
+    pad = 6
+    box = (max(box[0] - pad, 0), max(box[1] - pad, 0), min(box[2] + pad, W), min(box[3] + pad, H))
     out = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]), (20, 30, 80, 0))  # dark blue ink
-    out.putalpha(alpha.crop(box))
+    out.putalpha(clean.crop(box))
     buf = io.BytesIO()
     out.save(buf, "PNG")
     return buf.getvalue()
 
 
 def _stamp(writer: PdfWriter, page, rect, png: bytes) -> None:
-    """Draw the transparent signature PNG over a field rectangle (bottom aligned, may rise above the line)."""
+    """Draw the signature inside the field box: scaled to fit with its aspect ratio kept, left aligned,
+    sitting on the line, and clipped to the box so nothing can spill onto the rest of the form."""
     img = Image.open(io.BytesIO(png)).convert("RGBA")
     x1, y1, x2, y2 = (float(v) for v in rect)
-    h = min((y2 - y1) * 1.35, (x2 - x1 - 8) * img.height / img.width)  # stays below the line above
-    w = h * img.width / img.height
+    pad = 1.5
+    scale = min((x2 - x1 - 2 * pad) / img.width, (y2 - y1 - 2 * pad) / img.height)
+    w, h = img.width * scale, img.height * scale
 
     def stream(data: bytes, **keys) -> object:
         s = DecodedStreamObject()
@@ -85,7 +171,8 @@ def _stamp(writer: PdfWriter, page, rect, png: bytes) -> None:
     overlay[NameObject("/Resources")] = DictionaryObject({NameObject("/XObject"): DictionaryObject(
         {NameObject("/Sig"): image})})
     content = DecodedStreamObject()
-    content.set_data(f"q {w:.2f} 0 0 {h:.2f} {x1 + 4:.2f} {y1 + 1:.2f} cm /Sig Do Q".encode())
+    content.set_data((f"q {x1:.2f} {y1:.2f} {x2 - x1:.2f} {y2 - y1:.2f} re W n "  # clip to the field box
+                      f"{w:.2f} 0 0 {h:.2f} {x1 + pad:.2f} {y1 + pad:.2f} cm /Sig Do Q").encode())
     overlay[NameObject("/Contents")] = writer._add_object(content)
     page.merge_page(overlay)
 

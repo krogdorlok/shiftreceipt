@@ -204,3 +204,65 @@ def test_sign_typed_uses_typed_name(A, smtp):
     assert "typed name will sign" in say(A, "maria", "SIGN TYPED")
     assert say(A, "maria", "SEND 1").startswith("Sent")
     assert fields(smtp.sent[0].get_payload()[1].get_content())[notice.F_SIGN] == "Maria Lopez (typed)"
+
+
+def awkward_photo(kind: str) -> bytes:
+    """Phone-photo problems: shadow, table edge, ruled paper, dust specks, a stray mark."""
+    import math
+    import random
+    from PIL import Image, ImageDraw, ImageFilter
+    random.seed(3)
+    W, H = 1200, 800
+    img = Image.new("L", (W, H), 236)
+    if kind == "shadow":
+        img = Image.linear_gradient("L").resize((W, H)).point(lambda v: 236 - v // 3)
+    d = ImageDraw.Draw(img)
+    if kind == "table_edge":
+        d.rectangle((0, 0, W, H), fill=70)
+        d.rectangle((90, 70, W - 120, H - 60), fill=236)
+    if kind == "ruled":
+        for y in range(60, H, 45):
+            d.line([(0, y), (W, y)], fill=150, width=3)
+    if kind == "specks":
+        for _ in range(400):
+            x, y = random.randrange(W), random.randrange(H)
+            d.ellipse((x, y, x + 3, y + 3), fill=60)
+    if kind == "stray_mark":
+        d.line([(1050, 90), (1110, 120), (1080, 160)], fill=50, width=7)
+    d.line([(250 + t * 3, 400 + 55 * math.sin(t / 16) + 22 * math.sin(t / 5)) for t in range(200)], fill=40, width=8)
+    d.line([(580, 350), (650, 460), (700, 360)], fill=45, width=8)
+    buf = io.BytesIO()
+    img.filter(ImageFilter.GaussianBlur(1)).convert("RGB").save(buf, "JPEG", quality=80)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("kind", ["shadow", "table_edge", "ruled", "specks", "stray_mark"])
+def test_photo_problems_give_the_same_clean_crop(kind):
+    from PIL import Image
+    plain = Image.open(io.BytesIO(notice.clean_signature(awkward_photo("plain"))))
+    got = Image.open(io.BytesIO(notice.clean_signature(awkward_photo(kind))))
+    assert abs(got.width - plain.width) <= 0.05 * plain.width and abs(got.height - plain.height) <= 0.08 * plain.height
+
+
+@pytest.mark.parametrize("f", ["v1_posted_oct3.png", "team_two_people.png", "not_a_schedule.png", "injection_attempt.png"])
+def test_screenshots_are_not_signatures(f):
+    with pytest.raises(ValueError):
+        notice.clean_signature((notice.TEMPLATE.parent / "demo" / f).read_bytes())
+
+
+def test_signature_fits_the_field_box_with_aspect_kept():
+    import re as _re
+    from PIL import Image
+    png = notice.clean_signature(awkward_photo("plain"))
+    img = Image.open(io.BytesIO(png))
+    reader = PdfReader(io.BytesIO(notice.render_notice(PROFILE, LINES, date(2026, 10, 18), png)))
+    page = reader.pages[1]
+    rect = next(a.get_object()["/Rect"] for a in page["/Annots"] if a.get_object().get("/T") == notice.F_SIGN)
+    x1, y1, x2, y2 = (float(v) for v in rect)
+    content = page.get_contents().get_data().decode("latin-1")
+    num = r"([\d.]+)"
+    clip = [float(v) for v in _re.search(rf"{num}\s+{num}\s+{num}\s+{num}\s+re\s+W\s+n\s+{num}", content).groups()[:4]]
+    w, h, x, y = (float(v) for v in _re.search(rf"{num}\s+0\s+0\s+{num}\s+{num}\s+{num}\s+cm\s+/Sig", content).groups())
+    assert clip == [round(x1, 2), round(y1, 2), round(x2 - x1, 2), round(y2 - y1, 2)]  # clipped to the box
+    assert x1 <= x and x + w <= x2 and y1 <= y and y + h <= y2                      # drawn inside the box
+    assert abs(w / h - img.width / img.height) < 0.02                                # not stretched
