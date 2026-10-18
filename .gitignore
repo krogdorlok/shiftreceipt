@@ -7,3 +7,4 @@ __pycache__/
 .venv/
 .codex_last.log
 _to_delete/
+_dev/

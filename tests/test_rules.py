@@ -194,8 +194,10 @@ def test_total_by_rule_and_due_lines(demo):
     lines = R.evaluate(events, {e.id: NO_ANS for e in events}, YES, RATE) + R.rest_lines(v2.shifts, YES, RATE)
     assert R.total(lines, {"R2", "R3", "R4"}) == 7000 and R.total(lines, {"R6"}) == 8000
     from datetime import date
-    assert R.total(R.due_lines(lines, date(2026, 10, 18))) == 7000  # Sat Oct 24 not worked yet
-    assert R.total(R.due_lines(lines, date(2026, 10, 25))) == 15000
+    at = lambda d, h: datetime(2026, 10, d, h, tzinfo=LA)
+    assert R.total(R.due_lines(lines, at(18, 9), v2.shifts)) == 7000   # Sat Oct 24 not worked yet
+    assert R.total(R.due_lines(lines, at(24, 13), v2.shifts)) == 7000  # Sat shift still running (ends 2 PM)
+    assert R.total(R.due_lines(lines, at(24, 14), v2.shifts)) == 15000
 
 
 def test_total_counts_only_owed():

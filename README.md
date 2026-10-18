@@ -73,16 +73,26 @@ COVER yes yes yes
 
 Then the screenshots in `assets/demo` (or `SCHEDULE` blocks), `GOT 2026-10-03`, `CONFIRM`, and answer each `Q1 no`.
 Demo result: $70.00 schedule-change pay, plus $80.00 rest premium if Saturday is worked.
-`MODE manager` estimates what a draft change would cost before it is published.
 
 ## Run it
 
+Needs Python 3.10+, a [Gemini API key](https://aistudio.google.com/apikey), and a Gmail
+[app password](https://myaccount.google.com/apppasswords) for sending notices.
+
 ```
-bash setup.sh                    # venv, deps, tests
-cp .env.example .env             # AGENT_SEED, GEMINI_API_KEY, SMTP_USER, SMTP_APP_PASSWORD
-.venv/bin/python agent.py        # open the Agent Inspector link, connect Mailbox
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env             # fill AGENT_SEED, GEMINI_API_KEY, SMTP_USER, SMTP_APP_PASSWORD
+.venv/bin/python agent.py        # open the Agent Inspector link it prints, Connect -> Mailbox
 .venv/bin/python -m pytest -q    # offline tests, Gemini and SMTP mocked
 ```
+
+| File | Role |
+| --- | --- |
+| agent.py | uAgent, Chat Protocol, conversation state machine |
+| extract.py | Gemini reads the worker's shifts from a screenshot |
+| diff.py, rules.py | schedule changes and the pay rules (pure Python, integer cents) |
+| notice.py | fills the official OWS Notice to Cure PDF and emails it |
+| parser.py, db.py, models.py | commands, per-sender SQLite state, data types |
 
 ## Privacy and safety
 

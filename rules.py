@@ -133,10 +133,11 @@ def total(lines: list[LedgerLine], rules: set[str] | None = None) -> int:
     return sum(l.cents for l in lines if l.status == "may_be_owed" and (rules is None or l.rule in rules))
 
 
-def due_lines(lines: list[LedgerLine], today: date) -> list[LedgerLine]:
-    """Lines a notice may claim today: the rest premium only for a shift already past (owed only if worked)."""
+def due_lines(lines: list[LedgerLine], now: datetime, shifts: list[Shift]) -> list[LedgerLine]:
+    """Lines a notice may claim now: the rest premium only once its shift has ended (owed only if worked)."""
+    ended = {s.day for s in shifts if s.end_dt() <= now}
     return [l for l in lines if l.status == "may_be_owed"
-            and (l.rule != "R6" or date.fromisoformat(l.event_id.removeprefix("rest-")) < today)]
+            and (l.rule != "R6" or date.fromisoformat(l.event_id.removeprefix("rest-")) in ended)]
 
 
 def cure_deadline(received_at: datetime) -> date:

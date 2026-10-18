@@ -10,6 +10,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject, NumberObject, TextStringObject
 
 load_dotenv()
 TEMPLATE = Path(__file__).parent / "assets" / "notice_to_cure.pdf"
@@ -30,7 +31,7 @@ def usd(cents: int) -> str:
 def _description(lines: list[dict], note: str) -> str:
     out = [f"{l['day']}: {l['change']}, {usd(l['cents'])} may be owed ({l['citation']})." for l in lines]
     out.append(f"Total that may be owed: {usd(sum(l['cents'] for l in lines))}.")
-    return " ".join(out + ([note] if note else []))
+    return "\n".join(out + ([note] if note else []))  # one item per line in a multiline field
 
 
 def render_notice(profile: dict, lines: list[dict], sent_date: date) -> bytes:
@@ -54,6 +55,12 @@ def render_notice(profile: dict, lines: list[dict], sent_date: date) -> bytes:
     values = {k: v for k, v in text.items() if k in have}
     values.update({k: "/On" for k, on in boxes.items() if on and k in have})
     w = PdfWriter(clone_from=reader)
+    for page in w.pages:  # the template's description field is single-line: make it wrap, smaller font
+        for a in page.get("/Annots") or []:
+            a = a.get_object()
+            if a.get("/T") == F_DESC:
+                a[NameObject("/Ff")] = NumberObject(int(a.get("/Ff", 0)) | 4096)
+                a[NameObject("/DA")] = TextStringObject("/Helv 9 Tf 0 g")
     for page in w.pages:
         w.update_page_form_field_values(page, values, auto_regenerate=False)
     w.set_need_appearances_writer(True)

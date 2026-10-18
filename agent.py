@@ -3,7 +3,6 @@ import asyncio
 import hashlib
 import json
 import os
-import re
 import time as clock
 from collections import defaultdict
 from datetime import date, datetime, time, timezone
@@ -22,7 +21,7 @@ import notice
 import rules
 from diff import diff
 from extract import extract, schedule_text
-from models import LA, Answers, Coverage, ScheduleVersion, Shift
+from models import LA, Answers, Coverage, Shift
 from parser import _from_json, _strict, parse
 
 load_dotenv()
@@ -144,10 +143,6 @@ STEPS = [("name", "NAME your full name, e.g. NAME Maria Lopez"),
          ("manager", "MANAGER the email of the person who sets your schedule"),
          ("cover", COVER_TEXT)]
 CARDS = os.getenv("CARDS", "1") == "1"  # kill switch: the card schema is not verified against ASI:One
-MODE = re.compile(r"\s*MODE\s+(manager|worker)\s*", re.I)
-MANAGER_HELP = ("Manager mode: send the current schedule as a SCHEDULE block, then the draft you want to publish. "
-                "I estimate the predictability pay the change would cost. Set the pay rate with RATE 20. "
-                "MODE worker switches back. Not legal advice.")
 TEXT_FIELDS = {"NAME": "name", "EMPLOYER": "employer", "TITLE": "title", "STORE": "store"}
 FOOTER = ("When did you get this schedule? If not today reply GOT YYYY-MM-DD. Fix with EDIT YYYY-MM-DD HH:MM-HH:MM "
           "or DROP YYYY-MM-DD. Then CONFIRM.")
@@ -301,7 +296,7 @@ def receipt(sender: str) -> list[str]:
         out += [f"Rest premium that may be owed, only for shifts you actually work: {usd(rest)}"]
     out += [f"Estimated total: {usd(tot)}. This is an estimate, not unpaid wages yet: predictability pay is due on "
             "the payday for the pay period of the change.", rules.NOT_CHECKED, "Questions: OWS (844) 924-3752"]
-    due = rules.due_lines(lines, _today())
+    due = rules.due_lines(lines, datetime.now(LA), _current_shifts(vs))
     if due:
         # ponytail: a new pending notice per receipt; claim_notice's daily cap limits what can actually be sent
         keep = {l.event_id for l in due}
@@ -330,7 +325,8 @@ def _card(nid: int, cents: int, manager: str) -> MetadataContent | None:
         return None
     try:
         payload = {"title": "ShiftReceipt notice preview", "subtitle": f"{usd(cents)} may be owed",
-                   "body": f"Check your paycheck first. If the pay is missing, send the Notice to Cure to {manager}.",
+                   "body": f"Check your paycheck first. If the pay is missing, send the Notice to Cure to {manager}. "
+                           "Not legal advice.",
                    "cta": {"label": f"Send notice {nid}",
                            "selection": json.dumps({"action": "send", "receipt_id": str(nid)})}}
         return MetadataContent(type="metadata", metadata={
@@ -469,7 +465,7 @@ def run(sender: str, c) -> list[str]:
     if n == "RECEIPT":
         return receipt(sender)
     if n == "OT":
-        db.update_profile(DB_PATH, sender, ot={**data.get("ot", {}), a["day"].isoformat(): a["minutes"]})
+        db.update_profile(DB_PATH, sender, notice=None, ot={**data.get("ot", {}), a["day"].isoformat(): a["minutes"]})
         return [f"Saved {a['minutes']} overtime minutes on {_d(a['day'])}."]
     if n == "SEND":
         return send_notice(sender, a["id"])
@@ -491,49 +487,11 @@ def _prose_send(text: str, c) -> list[str] | None:
     return None
 
 
-def manager(sender: str, data: dict, c) -> list[str]:
-    """What would this draft cost? Assumes every change is employer-initiated and the worker is covered."""
-    if c and c.name == "RATE":
-        db.update_profile(DB_PATH, sender, rate=c.args["cents"])
-        return ["Saved. Send the current SCHEDULE, then the draft."]
-    if c and c.name == "RESET":
-        return run(sender, c)
-    if not c or c.name != "SCHEDULE":
-        return [MANAGER_HELP]
-    shifts = [Shift(**s) for s in c.args["shifts"]]
-    if not data.get("mgr_current"):
-        db.update_profile(DB_PATH, sender, mgr_current=[s.model_dump(mode="json") for s in shifts])
-        return ["Got the current schedule. Now send the draft SCHEDULE you want to publish."]
-    if not data.get("rate"):
-        return ["Reply RATE with the hourly pay first, e.g. RATE 20. Then send the draft again."]
-    now = datetime.now(LA)
-    v = [ScheduleVersion(id=i, sender=sender, received_at=now, learned_at=now, sha256=str(i), shifts=s)
-         for i, s in ((1, [Shift(**s) for s in data["mgr_current"]]), (2, shifts))]
-    events = diff(*v)
-    no = Answers(employee_requested=False, voluntary_cover=False, misconduct=False, already_paid=False)
-    lines = rules.evaluate(events, {e.id: no for e in events}, Coverage(retail=True, over_300=True, works_2h_la=True),
-                           data["rate"])
-    by_id = {e.id: e for e in events}
-    rows = [f"- {_d(by_id[l.event_id].day)} {KIND_WORDS[by_id[l.event_id].kind]}: "
-            + (usd(l.cents) if l.status == "may_be_owed" else l.status.replace("_", " ")) for l in lines]
-    return [f"Publishing this change would cost about {usd(rules.total(lines, PAY_RULES))} in predictability pay "
-            "(Rule 5). Changes made 14+ days ahead cost $0.\n" + "\n".join(rows or ["- no changes"])
-            + f"\nEstimate for one worker at {usd(data['rate'])}/h. Send another draft to compare, or MODE worker. "
-              "Not legal advice."]
-
-
 def handle_text(sender: str, text: str) -> list[str]:
     """One command per message, or one per line when every line is a command (pasted onboarding)."""
     text = text or ""
     if len(text) > 2000:  # never truncate: a cut paste can change a value (RATE 200 -> RATE 20)
         return ["That message is too long (2000 characters max). Please send it in parts."]
-    if m := MODE.fullmatch(text):
-        mode = m[1].lower()
-        db.update_profile(DB_PATH, sender, mode=mode, mgr_current=None)
-        return [MANAGER_HELP if mode == "manager" else "Worker mode. Send your schedule, or HELP."]
-    data, _ = db.get_profile(DB_PATH, sender)
-    if data.get("mode") == "manager":
-        return manager(sender, data, parse(text))
     lines = [l for l in text.splitlines() if l.strip()]
     if len(lines) > 1 and lines[0].strip().upper() != "SCHEDULE" and all(cmds := [parse(l) for l in lines]):
         out = []
@@ -580,10 +538,10 @@ chat = Protocol(spec=chat_protocol_spec)
 @chat.on_message(ChatMessage)
 async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
     await ctx.send(sender, ChatAcknowledgement(timestamp=_now(), acknowledged_msg_id=msg.msg_id))
-    if not await asyncio.to_thread(db.first_time, DB_PATH, f"{sender}:{msg.msg_id}"):
-        return
-    ctx.logger.info(f"msg {msg.msg_id} from {sender[:16]} items={len(msg.content)}")
-    async with LOCKS[sender]:
+    async with LOCKS[sender]:  # before dedupe: one sender's messages are handled in arrival order
+        if not await asyncio.to_thread(db.first_time, DB_PATH, f"{sender}:{msg.msg_id}"):
+            return
+        ctx.logger.info(f"msg {msg.msg_id} from {sender[:16]} items={len(msg.content)}")
         for item in msg.content:
             try:
                 await handle_item(ctx, sender, item)
