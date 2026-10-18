@@ -1,7 +1,8 @@
 VERDICT: FAIL
-Milestone: M1   Round: 1   Tests: 2 failed, 105 passed in 0.64s
+Milestone: M1   Round: 2   Tests: 2 failed, 107 passed in 0.62s
 ## Findings
-1. [MAJOR] agent.py:65  A malformed resource URI such as `http://[bad` raises ValueError before a valid metadata URL can be tried, so the handler gives a generic error instead of the required schedule fallback. Catch URL parsing errors in `_http` and convert them to DownloadError in `download` at line 37. Test: tests/review/test_m1_1.py
+1. [MAJOR] agent.py:57  A 200 image/png response with zero bytes returns success, so the handler claims it received a 1 KB schedule instead of offering the typed fallback. Raise DownloadError when the body is empty. Test: tests/review/test_m1_2.py
+2. [MAJOR] agent.py:41  HTTPX reads redirect bodies before the 10 MB cap runs; an 11 MB redirect body is accepted and larger ones can exhaust memory. Follow redirects while streaming and cap each response body. Test: tests/review/test_m1_2.py
 ## Invariants
 1-8: OK
 ## Disputed tests
