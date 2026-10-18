@@ -7,7 +7,7 @@ A worker-side agent for the City of Los Angeles Fair Work Week Ordinance (FWWO),
 
 Built during LA Hacks AI Hackathon Oct 17-18 2026. All code in this repo was written during the event.
 
-**Agent:** `shiftreceipt` &nbsp; **Address:** `agent1q...` (printed on startup; fill in before submission)
+**Agent:** `shiftreceipt` &nbsp; **Address:** `agent1qffxdzuxgw6ad4k6dmlsfxd4h7ey26mgsfs0nt6lkgz8wv97z4w7wfexzpq`
 
 ## The problem
 
