@@ -76,12 +76,13 @@ Demo result: $70.00 schedule-change pay, plus $80.00 rest premium if Saturday is
 
 ## Run it
 
-Needs Python 3.10+, a [Gemini API key](https://aistudio.google.com/apikey), and a Gmail
-[app password](https://myaccount.google.com/apppasswords) for sending notices.
+Needs Python 3.10+, a [Gemini API key](https://aistudio.google.com/apikey), and one way to send email:
+a [Resend](https://resend.com) API key (HTTPS, works on networks that block mail ports; free plan delivers
+to the account's own address) or a Gmail [app password](https://myaccount.google.com/apppasswords).
 
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env             # fill AGENT_SEED, GEMINI_API_KEY, SMTP_USER, SMTP_APP_PASSWORD
+cp .env.example .env             # fill AGENT_SEED, GEMINI_API_KEY, RESEND_API_KEY (or SMTP_*)
 .venv/bin/python agent.py        # open the Agent Inspector link it prints, Connect -> Mailbox
 .venv/bin/python -m pytest -q    # offline tests, Gemini and SMTP mocked
 ```
