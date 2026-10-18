@@ -1,5 +1,5 @@
-ShiftReceipt helps hourly retail workers in the City of Los Angeles check schedule changes under the Fair Work Week Ordinance.
-Send a screenshot of each schedule you receive; it compares versions and lists changes where predictability pay may be owed.
-Example messages: a schedule screenshot, `HELP`, `RATE 20`, `COVER yes yes yes`, or a typed `SCHEDULE` block with lines like `2026-10-20 09:00-17:00 Westwood`.
-It prepares a draft notice to your employer and emails it only after you type `SEND <id>`.
+ShiftReceipt helps hourly retail workers in the City of Los Angeles get paid for last-minute schedule changes under the Fair Work Week Ordinance.
+Send a screenshot of each schedule you get: it compares versions and shows, change by change, what predictability pay may be owed and why.
+Start with `hi`. Example messages: a schedule screenshot, `GOT 2026-10-17 CONFIRM`, `Q1 no Q2 no`, `RECEIPT`, `HELP`.
+It prepares the City's official Notice to Cure, signed with a photo of your signature, and emails it to your manager only after you type `SEND 1`.
 Not legal advice.

@@ -8,3 +8,4 @@ __pycache__/
 .codex_last.log
 _to_delete/
 _dev/
+.DS_Store
