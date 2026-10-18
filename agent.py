@@ -1,7 +1,9 @@
 """ShiftReceipt agent: ASI:One Chat Protocol front end and the worker flow (state per sender in SQLite)."""
 import asyncio
 import hashlib
+import json
 import os
+import re
 import time as clock
 from collections import defaultdict
 from datetime import date, datetime, time, timezone
@@ -20,7 +22,7 @@ import notice
 import rules
 from diff import diff
 from extract import extract, schedule_text
-from models import LA, Answers, Coverage, Shift
+from models import LA, Answers, Coverage, ScheduleVersion, Shift
 from parser import _from_json, _strict, parse
 
 load_dotenv()
@@ -114,8 +116,14 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def reply(ctx: Context, to: str, text: str) -> None:
-    await ctx.send(to, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[TextContent(type="text", text=text)]))
+async def reply(ctx: Context, to: str, item: "str | MetadataContent") -> None:
+    if isinstance(item, MetadataContent):  # a card: always sent after its text, and never breaks the flow
+        try:
+            await ctx.send(to, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[item]))
+        except Exception as e:
+            ctx.logger.error(f"card failed: {type(e).__name__}")
+        return
+    await ctx.send(to, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[TextContent(type="text", text=item)]))
 
 
 # ---- M3 worker flow. Sync on purpose: the handler runs it in asyncio.to_thread (db, Gemini). ----
@@ -135,6 +143,11 @@ STEPS = [("name", "NAME your full name, e.g. NAME Maria Lopez"),
          ("store", "STORE your store and city, e.g. STORE Westwood, Los Angeles"),
          ("manager", "MANAGER the email of the person who sets your schedule"),
          ("cover", COVER_TEXT)]
+CARDS = os.getenv("CARDS", "1") == "1"  # kill switch: the card schema is not verified against ASI:One
+MODE = re.compile(r"\s*MODE\s+(manager|worker)\s*", re.I)
+MANAGER_HELP = ("Manager mode: send the current schedule as a SCHEDULE block, then the draft you want to publish. "
+                "I estimate the predictability pay the change would cost. Set the pay rate with RATE 20. "
+                "MODE worker switches back. Not legal advice.")
 TEXT_FIELDS = {"NAME": "name", "EMPLOYER": "employer", "TITLE": "title", "STORE": "store"}
 FOOTER = ("When did you get this schedule? If not today reply GOT YYYY-MM-DD. Fix with EDIT YYYY-MM-DD HH:MM-HH:MM "
           "or DROP YYYY-MM-DD. Then CONFIRM.")
@@ -295,6 +308,7 @@ def receipt(sender: str) -> list[str]:
         due_saved = [s for s in saved if s["event_id"] in keep]
         nid = db.create_notice(DB_PATH, sender, due_saved, rules.total(due))
         db.update_profile(DB_PATH, sender, notice={"id": nid, "lines": due_saved})
+        card = _card(nid, rules.total(due), data["manager"])
         out += ["", f"Notice preview ({nid}): {data['employer']} may owe {data['name']} {usd(rules.total(due))} "
                     "under the LA Fair Work Week Ordinance for:"]
         out += [f"- {s['day']} {s['change']}: {usd(s['cents'])}" for s in saved if s["event_id"] in keep]
@@ -307,7 +321,23 @@ def receipt(sender: str) -> list[str]:
     else:
         out += ["", "Nothing may be owed right now (the reason is on each line). Your saved schedules protect you "
                     "later: send every new schedule you get and I compare it with these."]
-    return ["\n".join(out)]
+    return ["\n".join(out)] + ([card] if due and card else [])
+
+
+def _card(nid: int, cents: int, manager: str) -> MetadataContent | None:
+    """Interactive card with one button; the click comes back as {"action": "send", "receipt_id": "<id>"}."""
+    if not CARDS:
+        return None
+    try:
+        payload = {"title": "ShiftReceipt notice preview", "subtitle": f"{usd(cents)} may be owed",
+                   "body": f"Check your paycheck first. If the pay is missing, send the Notice to Cure to {manager}.",
+                   "cta": {"label": f"Send notice {nid}",
+                           "selection": json.dumps({"action": "send", "receipt_id": str(nid)})}}
+        return MetadataContent(type="metadata", metadata={
+            "card_protocol_version": "1", "requires_card_interaction": "true", "card_kind": "custom",
+            "card_payload": json.dumps(payload)})
+    except Exception:
+        return None
 
 
 def _known(sender: str, sha: str) -> list[str] | None:
@@ -461,11 +491,49 @@ def _prose_send(text: str, c) -> list[str] | None:
     return None
 
 
+def manager(sender: str, data: dict, c) -> list[str]:
+    """What would this draft cost? Assumes every change is employer-initiated and the worker is covered."""
+    if c and c.name == "RATE":
+        db.update_profile(DB_PATH, sender, rate=c.args["cents"])
+        return ["Saved. Send the current SCHEDULE, then the draft."]
+    if c and c.name == "RESET":
+        return run(sender, c)
+    if not c or c.name != "SCHEDULE":
+        return [MANAGER_HELP]
+    shifts = [Shift(**s) for s in c.args["shifts"]]
+    if not data.get("mgr_current"):
+        db.update_profile(DB_PATH, sender, mgr_current=[s.model_dump(mode="json") for s in shifts])
+        return ["Got the current schedule. Now send the draft SCHEDULE you want to publish."]
+    if not data.get("rate"):
+        return ["Reply RATE with the hourly pay first, e.g. RATE 20. Then send the draft again."]
+    now = datetime.now(LA)
+    v = [ScheduleVersion(id=i, sender=sender, received_at=now, learned_at=now, sha256=str(i), shifts=s)
+         for i, s in ((1, [Shift(**s) for s in data["mgr_current"]]), (2, shifts))]
+    events = diff(*v)
+    no = Answers(employee_requested=False, voluntary_cover=False, misconduct=False, already_paid=False)
+    lines = rules.evaluate(events, {e.id: no for e in events}, Coverage(retail=True, over_300=True, works_2h_la=True),
+                           data["rate"])
+    by_id = {e.id: e for e in events}
+    rows = [f"- {_d(by_id[l.event_id].day)} {KIND_WORDS[by_id[l.event_id].kind]}: "
+            + (usd(l.cents) if l.status == "may_be_owed" else l.status.replace("_", " ")) for l in lines]
+    return [f"Publishing this change would cost about {usd(rules.total(lines, PAY_RULES))} in predictability pay "
+            "(Rule 5). Changes made 14+ days ahead cost $0.\n" + "\n".join(rows or ["- no changes"])
+            + f"\nEstimate for one worker at {usd(data['rate'])}/h. Send another draft to compare, or MODE worker. "
+              "Not legal advice."]
+
+
 def handle_text(sender: str, text: str) -> list[str]:
     """One command per message, or one per line when every line is a command (pasted onboarding)."""
     text = text or ""
     if len(text) > 2000:  # never truncate: a cut paste can change a value (RATE 200 -> RATE 20)
         return ["That message is too long (2000 characters max). Please send it in parts."]
+    if m := MODE.fullmatch(text):
+        mode = m[1].lower()
+        db.update_profile(DB_PATH, sender, mode=mode, mgr_current=None)
+        return [MANAGER_HELP if mode == "manager" else "Worker mode. Send your schedule, or HELP."]
+    data, _ = db.get_profile(DB_PATH, sender)
+    if data.get("mode") == "manager":
+        return manager(sender, data, parse(text))
     lines = [l for l in text.splitlines() if l.strip()]
     if len(lines) > 1 and lines[0].strip().upper() != "SCHEDULE" and all(cmds := [parse(l) for l in lines]):
         out = []
@@ -559,6 +627,7 @@ def main() -> None:
     agent = Agent(name=os.getenv("AGENT_NAME", "shiftreceipt"), seed=seed, port=int(os.getenv("AGENT_PORT", "8001")),
                   mailbox=True, readme_path="README_AGENT.md",
                   description="Checks LA Fair Work Week schedule changes and drafts a predictability pay notice.",
+                  handle=os.getenv("AGENT_HANDLE") or None, avatar_url=os.getenv("AGENT_AVATAR_URL") or None,
                   publish_agent_details=True, handle_messages_concurrently=True)
     agent.include(chat, publish_manifest=True)
 
