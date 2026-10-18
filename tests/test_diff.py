@@ -48,6 +48,10 @@ def test_moved_to_other_day_same_week_is_one_event():
     assert [e.kind for e in ev] == ["moved"] and ev[0].day == date(2026, 10, 20)
 
 
+def test_moved_to_other_day_new_hours_same_week_needs_review():
+    assert kinds([S("2026-10-20", "09:00", "17:00")], [S("2026-10-22", "09:00", "14:00")]) == ["needs_review"] * 2
+
+
 def test_moved_to_next_week_is_cancel_plus_add():
     assert sorted(kinds([S("2026-10-23", "09:00", "17:00")], [S("2026-10-27", "09:00", "17:00")])) == ["added", "cancelled"]
 

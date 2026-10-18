@@ -62,8 +62,12 @@ def diff(prev: ScheduleVersion, curr: ScheduleVersion) -> list[ChangeEvent]:
             removed.remove(old)
             added.remove(match)
             add(min(old.day, match.day), "moved", old, match)
+    # Left over in one week: maybe a move to another day with different hours (City FAQ counts that as one
+    # change, cancel + add would overpay). The pairing is a guess, so mark those days for review.
+    wk = lambda s: s.day.isocalendar()[:2]
+    both = {wk(o) for o in removed} & {wk(n) for n in added}
     for old in removed:
-        add(old.day, "cancelled", old=old)
+        add(old.day, "needs_review" if wk(old) in both else "cancelled", old=old)
     for new in added:
-        add(new.day, "added", new=new)
+        add(new.day, "needs_review" if wk(new) in both else "added", new=new)
     return sorted(events, key=lambda e: (e.day, e.id))

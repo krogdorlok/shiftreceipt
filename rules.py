@@ -7,7 +7,7 @@ NOTICE_DAYS = 14   # Rule 4
 REST_MINUTES = 600  # Rule 6: 10 hours
 CURE_DAYS = 15     # Rule 10
 ADDED = {"added", "hours_added", "moved_and_added"}
-CUT = {"cancelled", "hours_cut"}
+CUT = {"cancelled", "hours_cut", "moved_and_cut"}
 CITE_PAY = "OWS FWWO Rule 5 (predictability pay)"
 CITE_EXEMPT = "OWS FWWO Rule 5.1, LAMC 185.06.B (exceptions)"
 CITE_NOTICE = "OWS FWWO Rule 4 (14-day notice)"
@@ -23,9 +23,28 @@ def money(rate_cents: int, minutes: int, num: int, den: int) -> int:
     return (2 * x + d) // (2 * d)
 
 
+def period_start(day: date) -> date:
+    # ponytail: assumes Mon-Sun work periods; take the start date from the posted schedule if employers differ
+    return day - timedelta(days=day.weekday())
+
+
 def is_late(e: ChangeEvent) -> bool:
+    """Notice is measured from the start of the Work Period, not from the changed shift (City FAQ 36, 50, 52)."""
     learned = e.learned_at.astimezone(LA).date()
-    return (e.day - learned).days < NOTICE_DAYS
+    return (period_start(e.day) - learned).days < NOTICE_DAYS
+
+
+def _loc_changed(old: Shift, new: Shift) -> bool:
+    return bool(old.location and new.location) and old.location.strip().lower() != new.location.strip().lower()
+
+
+def changes(e: ChangeEvent) -> int:
+    """Hours of pay for date, location and time changes (City FAQ predictability pay table).
+    A time change counts only when the hours stay the same; otherwise the hours change is the time change."""
+    if not (e.old and e.new):
+        return 0
+    n = (e.old.day != e.new.day) + _loc_changed(e.old, e.new)
+    return n + (e.kind == "moved" and e.old.start != e.new.start)
 
 
 def _required(e: ChangeEvent) -> list[str]:
@@ -41,7 +60,7 @@ def missing_answers(events: list[ChangeEvent], answers: dict[str, Answers]) -> l
     """(event_id, field) pairs the agent must still ask about, late payable events only."""
     out = []
     for e in events:
-        if e.kind in ("needs_review", "moved_and_cut") or not is_late(e):
+        if e.kind == "needs_review" or not is_late(e):
             continue
         a = answers.get(e.id, Answers())
         out += [(e.id, f) for f in _required(e) if getattr(a, f) is None]
@@ -60,8 +79,8 @@ def evaluate(events: list[ChangeEvent], answers: dict[str, Answers], coverage: C
         a = answers.get(e.id, Answers())
         if not coverage.covered():
             lines.append(_line(e, rule, 0, "not_covered", CITE_COVER, "Coverage not confirmed; check with OWS."))
-        elif e.kind in ("needs_review", "moved_and_cut"):
-            lines.append(_line(e, "REVIEW", 0, "needs_review", CITE_PAY, "Combined change; review with OWS."))
+        elif e.kind == "needs_review" or (e.kind == "moved" and not changes(e)):
+            lines.append(_line(e, "REVIEW", 0, "needs_review", CITE_PAY, "Unclear change; review with OWS."))
         elif not is_late(e):
             lines.append(_line(e, rule, 0, "not_late", CITE_NOTICE, "Changed 14 or more days ahead."))
         elif any(getattr(a, f) is None for f in _required(e)):
@@ -71,13 +90,15 @@ def evaluate(events: list[ChangeEvent], answers: dict[str, Answers], coverage: C
         elif a.employee_requested or (e.kind in ADDED and a.voluntary_cover) or (e.kind in CUT and a.misconduct):
             lines.append(_line(e, rule, 0, "exempt", CITE_EXEMPT, "An exception applies."))
         elif e.kind in CUT:
-            lost = -e.minutes_delta
-            lines.append(_line(e, rule, money(rate_cents, lost, 1, 2), "may_be_owed", CITE_PAY,
-                               f"{lost} min cut with under 14 days notice: half pay for hours not worked."))
+            lost, n = -e.minutes_delta, changes(e)
+            extra = f" plus {n} h of pay for {n} date/location change(s)" if n else ""
+            lines.append(_line(e, rule, money(rate_cents, lost, 1, 2) + n * rate_cents, "may_be_owed", CITE_PAY,
+                               f"{lost} min cut with under 14 days notice: half pay for hours not worked{extra}."))
         else:
+            n = (e.kind in ADDED) + changes(e)
             why = "Hours added" if e.kind in ADDED else "Date, time or location changed"
-            lines.append(_line(e, rule, rate_cents, "may_be_owed", CITE_PAY,
-                               f"{why} with under 14 days notice: 1 hour of pay."))
+            lines.append(_line(e, rule, n * rate_cents, "may_be_owed", CITE_PAY,
+                               f"{why} with under 14 days notice: {n} h of pay (1 h per change)."))
     return lines
 
 
@@ -107,9 +128,16 @@ def rest_lines(shifts: list[Shift], coverage: Coverage, rate_cents: int,
     return out
 
 
-def total(lines: list[LedgerLine]) -> int:
-    return sum(l.cents for l in lines if l.status == "may_be_owed")
+def total(lines: list[LedgerLine], rules: set[str] | None = None) -> int:
+    return sum(l.cents for l in lines if l.status == "may_be_owed" and (rules is None or l.rule in rules))
 
 
-def cure_deadline(sent_at: datetime) -> date:
-    return sent_at.astimezone(LA).date() + timedelta(days=CURE_DAYS)
+def due_lines(lines: list[LedgerLine], today: date) -> list[LedgerLine]:
+    """Lines a notice may claim today: the rest premium only for a shift already past (owed only if worked)."""
+    return [l for l in lines if l.status == "may_be_owed"
+            and (l.rule != "R6" or date.fromisoformat(l.event_id.removeprefix("rest-")) < today)]
+
+
+def cure_deadline(received_at: datetime) -> date:
+    """15 days from the employer's receipt of the Notice to Cure, not from when it was sent."""
+    return received_at.astimezone(LA).date() + timedelta(days=CURE_DAYS)

@@ -45,18 +45,22 @@ def test_rounding_half_up():
     assert R.money(1, 30, 1, 2) == 0 and R.money(1, 60, 1, 2) == 1  # 0.25 -> 0, 0.5 -> 1
 
 
-def test_fourteen_day_boundary():
-    late = one(BASE, [S("2026-10-20", "13:00", "21:00")], learned="2026-10-07T23:59")  # 13 days
-    ok = one(BASE, [S("2026-10-20", "13:00", "21:00")], learned="2026-10-06T00:01")    # 14 days
-    assert late.status == "may_be_owed" and ok.status == "not_late" and ok.cents == 0
+def test_fourteen_day_boundary_from_work_period_start():
+    # Work Period Mon Oct 19 - Sun Oct 25: notice due by Oct 5, for every shift in the period (City FAQ 36, 50)
+    for day in ("2026-10-20", "2026-10-25"):
+        base, moved = [S(day, "09:00", "17:00")], [S(day, "13:00", "21:00")]
+        late = one(base, moved, learned="2026-10-06T00:01")  # 13 days before Oct 19
+        ok = one(base, moved, learned="2026-10-05T23:59")    # 14 days before Oct 19
+        assert late.status == "may_be_owed" and ok.status == "not_late" and ok.cents == 0, day
+    assert str(R.period_start(datetime(2026, 10, 25).date())) == "2026-10-19"
 
 
 def test_lateness_uses_la_date_not_utc():
     from datetime import timezone
     e = ev(BASE, [S("2026-10-20", "13:00", "21:00")])[0]
-    # 2026-10-07 03:00 UTC is still Oct 6 in LA: 14 days ahead, so not late
-    assert R.is_late(e.model_copy(update={"learned_at": datetime(2026, 10, 7, 3, 0, tzinfo=timezone.utc)})) is False
-    assert R.is_late(e.model_copy(update={"learned_at": datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc)})) is True
+    # 2026-10-06 03:00 UTC is still Oct 5 in LA: 14 days before the Oct 19 period start, so not late
+    assert R.is_late(e.model_copy(update={"learned_at": datetime(2026, 10, 6, 3, 0, tzinfo=timezone.utc)})) is False
+    assert R.is_late(e.model_copy(update={"learned_at": datetime(2026, 10, 6, 9, 0, tzinfo=timezone.utc)})) is True
 
 
 def test_coverage_blocks_all_amounts():
@@ -95,9 +99,45 @@ def test_already_paid():
     assert (l.status, l.cents) == ("already_paid", 0)
 
 
-def test_combined_change_needs_review():
-    l = one(BASE, [S("2026-10-20", "10:00", "15:00")])
+A, B = "Location A", "Location B"
+MON = [S("2026-10-19", "12:00", "17:00", A)]
+
+
+def test_city_faq_table():
+    """City FAQ predictability pay table, $20/h, Mon 12-5 PM at Location A (5 h)."""
+    rows = [
+        ([S("2026-10-19", "12:00", "18:00", A)], "R2", 2000),          # +1 h: 1 h
+        ([S("2026-10-19", "12:00", "20:00", B)], "R2", 4000),          # +3 h, location: 2 h
+        ([S("2026-10-19", "09:00", "14:00", A)], "R3", 2000),          # time: 1 h
+        ([S("2026-10-22", "12:00", "17:00", A)], "R3", 2000),          # date: 1 h
+        ([S("2026-10-19", "09:00", "14:00", B)], "R3", 4000),          # time, location: 2 h
+        ([S("2026-10-20", "09:00", "14:00", B)], "R3", 6000),          # time, location, date: 3 h
+        ([S("2026-10-19", "12:00", "14:00", A)], "R4", 3000),          # -3 h: half of 3 h
+        ([S("2026-10-19", "12:00", "15:00", B)], "R4", 2000 + 2000),   # -2 h, location: half of 2 h + 1 h
+        ([], "R4", 5000),                                              # cancelled: half of 5 h
+    ]
+    for new, rule, cents in rows:
+        l = one(MON, new)
+        assert (l.rule, l.cents, l.status) == (rule, cents, "may_be_owed"), new
+
+
+def test_move_to_other_day_with_new_hours_needs_review():
+    # City FAQ: Mon 12-5 A -> Tue 9-3 B is one change worth 3 h. Pairing a cancel with an add is a guess: review.
+    for new in ([S("2026-10-20", "09:00", "15:00", B)], [S("2026-10-20", "09:00", "12:00", B)]):
+        lines = R.evaluate(ev(MON, new), {}, YES, RATE)
+        assert [(l.rule, l.status, l.cents) for l in lines] == [("REVIEW", "needs_review", 0)] * 2
+    assert R.missing_answers(ev(MON, [S("2026-10-20", "09:00", "15:00", B)]), {}) == []
+
+
+def test_missing_location_is_not_a_location_change():
+    l = one([S("2026-10-19", "12:00", "17:00", None)], [S("2026-10-19", "12:00", "17:00", A)])
     assert (l.rule, l.status, l.cents) == ("REVIEW", "needs_review", 0)
+
+
+def test_combined_time_change_and_cut():
+    l = one(BASE, [S("2026-10-20", "10:00", "15:00")])  # cut 3 h by a time change: half of 3 h only
+    assert (l.rule, l.status, l.cents) == ("R4", "may_be_owed", 3000)
+    assert R.missing_answers(ev(BASE, [S("2026-10-20", "10:00", "15:00")]), {})[1][1] == "misconduct"
 
 
 def test_every_line_has_citation():
@@ -146,6 +186,16 @@ def test_demo_receipt_matches_pitch(demo):
     assert R.total(lines) == 15000
     e3 = diff(v2, v3)
     assert R.evaluate(e3, {e3[0].id: NO_ANS}, YES, RATE)[0].cents == 8000  # Sunday 8 h cancelled
+
+
+def test_total_by_rule_and_due_lines(demo):
+    v1, v2, _ = demo
+    events = diff(v1, v2)
+    lines = R.evaluate(events, {e.id: NO_ANS for e in events}, YES, RATE) + R.rest_lines(v2.shifts, YES, RATE)
+    assert R.total(lines, {"R2", "R3", "R4"}) == 7000 and R.total(lines, {"R6"}) == 8000
+    from datetime import date
+    assert R.total(R.due_lines(lines, date(2026, 10, 18))) == 7000  # Sat Oct 24 not worked yet
+    assert R.total(R.due_lines(lines, date(2026, 10, 25))) == 15000
 
 
 def test_total_counts_only_owed():
