@@ -20,7 +20,7 @@ import rules
 from diff import diff
 from extract import extract, schedule_text
 from models import LA, Answers, Coverage, Shift
-from parser import parse
+from parser import _from_json, _strict, parse
 
 load_dotenv()
 DB_PATH = os.getenv("DB_PATH", "shiftreceipt.db")
@@ -198,9 +198,29 @@ def _describe(e) -> str:
     return f"{what} ({_shift(e.old or e.new)})" if (e.old or e.new) else what
 
 
+def _week(d: date):
+    return d.isocalendar()[:2]
+
+
+def _in_week(v, w):
+    return v.model_copy(update={"shifts": [s for s in v.shifts if _week(s.day) == w]})
+
+
 def _events(sender: str):
+    """Each work week is compared only with earlier schedules that cover the same week."""
+    # ponytail: a schedule with no shifts at all in a week cannot say "week cancelled"; screenshots never do
     vs = db.versions(DB_PATH, sender)
-    return vs, [e for a, b in zip(vs, vs[1:]) for e in diff(a, b)]
+    events = []
+    for w in sorted({_week(s.day) for v in vs for s in v.shifts}):
+        cover = [_in_week(v, w) for v in vs if any(_week(s.day) == w for s in v.shifts)]
+        events += [e for a, b in zip(cover, cover[1:]) for e in diff(a, b)]
+    return vs, sorted(events, key=lambda e: (e.day, e.id))
+
+
+def _current_shifts(vs) -> list[Shift]:
+    """Latest known shifts for every week (versions are in learned order)."""
+    latest = {_week(s.day): v for v in vs for s in v.shifts}
+    return [s for w, v in latest.items() for s in v.shifts if _week(s.day) == w]
 
 
 def _ask(events, qs: dict) -> str:
@@ -236,7 +256,7 @@ def receipt(sender: str) -> list[str]:
     cov = Coverage(**data["cover"])
     ot = {date.fromisoformat(k): v for k, v in data.get("ot", {}).items()}
     lines = (rules.evaluate(events, db.get_answers(DB_PATH, sender), cov, data["rate"])
-             + rules.rest_lines(vs[-1].shifts, cov, data["rate"], ot))
+             + rules.rest_lines(_current_shifts(vs), cov, data["rate"], ot))
     by_id = {e.id: e for e in events}
     out, saved = ["Your schedule receipt:"], []
     if len(vs) == 1:
@@ -290,7 +310,10 @@ def _known(sender: str, sha: str) -> list[str] | None:
     return [_show(v)] if not _missing(data) else ["Already saved; I will show it once you are set up."]
 
 
-def _new_version(sender: str, sha: str, shifts: list[Shift], warnings: list[str]) -> list[str]:
+def _new_version(sender: str, sha: str, shifts: list[Shift], warnings: list[str], typed: bool = False) -> list[str]:
+    same = next((v for v in db.versions(DB_PATH, sender, confirmed_only=False) if v.sha256 == sha), None)
+    if typed and same and _sha_shifts(same.shifts) != sha:  # that version was edited since: this one is new
+        sha = hashlib.sha256(f"{sha}:after:{same.id}".encode()).hexdigest()
     if (known := _known(sender, sha)) is not None:
         return known
     vid, _ = db.add_version(DB_PATH, sender, sha, shifts)
@@ -347,17 +370,18 @@ def run(sender: str, c) -> list[str]:
         PENDING_IMAGES.pop(sender, None)
         return ["Reset done.\n" + _setup_prompt([k for k, _ in STEPS])]
     if n in TEXT_FIELDS:
-        db.update_profile(DB_PATH, sender, **{TEXT_FIELDS[n]: " ".join(a["value"].split())})
+        db.update_profile(DB_PATH, sender, notice=None, **{TEXT_FIELDS[n]: " ".join(a["value"].split())})
         return _after_setup_field(sender, state)
     if n in ("RATE", "MANAGER", "COVER"):
-        db.update_profile(DB_PATH, sender, **{"RATE": {"rate": a.get("cents")}, "MANAGER": {"manager": a.get("email")},
-                                              "COVER": {"cover": a}}[n])
+        db.update_profile(DB_PATH, sender, notice=None,  # a changed profile needs a fresh preview
+                          **{"RATE": {"rate": a.get("cents")}, "MANAGER": {"manager": a.get("email")},
+                             "COVER": {"cover": a}}[n])
         return _after_setup_field(sender, state)
     if n == "SCHEDULE":
         shifts = [Shift(**s) for s in a["shifts"]]
         if any(s.minutes() > 16 * 60 for s in shifts):
             return ["A shift longer than 16 hours looks like a typo. Please check and send it again."]
-        return _new_version(sender, _sha_shifts(shifts), shifts, [])
+        return _new_version(sender, _sha_shifts(shifts), shifts, [], typed=True)
     if m := _missing(data):
         return [_setup_prompt(m)]
     if n in ("GOT", "EDIT", "DROP", "CONFIRM"):
@@ -426,6 +450,8 @@ def handle_text(sender: str, text: str) -> list[str]:
             out = run(sender, c)
         return out
     c = parse(text)
+    if c and c.name == "SEND" and not (_strict(text) or _from_json(text)):  # prose like "do not send receipt 7"
+        return [f"To email notice {c.args['id']}, type SEND {c.args['id']}."]
     if not c:
         data, _ = db.get_profile(DB_PATH, sender)
         m = _missing(data)

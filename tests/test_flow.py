@@ -148,3 +148,21 @@ def test_not_covered_skips_questions_and_amounts(A):
     for s in (schedule_text(fixture("v1")), "GOT 2026-10-03", "CONFIRM", schedule_text(fixture("v2")), "CONFIRM"):
         r = say(A, "u", s)
     assert "Q1" not in r and "Estimated total: $0.00" in r and "SEND" not in r
+
+
+def test_next_week_is_not_a_change_and_edited_reupload_is_new(A):
+    from conftest import S
+    say(A, "u", "\n".join(SETUP))
+    for s in (schedule_text([S("2026-10-20", "09:00", "17:00")]), "GOT 2026-10-03", "CONFIRM",
+              schedule_text([S("2026-10-27", "09:00", "17:00")]), "GOT 2026-10-17"):
+        say(A, "u", s)
+    r = say(A, "u", "CONFIRM")
+    assert "Q1" not in r and "Estimated total: $0.00" in r
+    original = schedule_text([S("2026-11-03", "09:00", "17:00")])
+    for s in (original, "EDIT 2026-11-03 10:00-18:00", "CONFIRM"):
+        say(A, "u", s)
+    assert "Here is what I read" in say(A, "u", original)
+
+
+def test_prose_send_is_not_a_send(A):
+    assert "type SEND 7" in say(A, "u", "Do not send receipt 7")
