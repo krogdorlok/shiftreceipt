@@ -307,7 +307,7 @@ def receipt(sender: str) -> list[str]:
         keep = {l.event_id for l in due}
         due_saved = [s for s in saved if s["event_id"] in keep]
         nid = db.create_notice(DB_PATH, sender, due_saved, rules.total(due))
-        db.update_profile(DB_PATH, sender, notice={"id": nid, "lines": due_saved})
+        db.update_profile(DB_PATH, sender, notice={"id": nid, "lines": due_saved, "day": _today().isoformat()})
         card = _card(nid, rules.total(due), data["manager"])
         out += ["", f"Notice preview ({nid}): {data['employer']} may owe {data['name']} {usd(rules.total(due))} "
                     "under the LA Fair Work Week Ordinance for:"]
@@ -554,6 +554,8 @@ def send_notice(sender: str, nid: int) -> list[str]:
     """Only the latest notice preview, only for its owner, only once (db.claim_notice is atomic and capped)."""
     data, _ = db.get_profile(DB_PATH, sender)
     pending = data.get("notice") or {}
+    if pending.get("id") == nid and pending.get("day") != _today().isoformat():
+        return ["That preview is from an earlier day. Reply RECEIPT for a fresh one."]
     if pending.get("id") != nid or not db.claim_notice(DB_PATH, sender, nid):
         return ["That notice is not pending or the daily limit is reached."]
     now = datetime.now(LA)

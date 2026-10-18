@@ -91,7 +91,8 @@ def _from_json(t: str) -> Command | None:
 def _from_prose(t: str) -> Command | None:
     """Planner-relayed clicks: 'The user chose to send receipt 7'. Only unambiguous patterns."""
     low = t.lower()
-    if (m := re.search(r"\bsend\b\D{0,30}?(\d{1,6})\b", low)):
+    negated = re.search(r"\b(not|don't|dont|never|no)\b", low)
+    if (m := re.search(r"\bsend\b\D{0,30}?(\d{1,6})\b", low)) and not negated:
         return Command(name="SEND", args={"id": int(m[1])})
     if (m := re.search(r"\bq(?:uestion)?\s*(\d{1,3})\b\D{0,20}?\b(yes|no)\b", low)):
         return Command(name="ANSWER", args={"q": int(m[1]), "value": m[2] == "yes"})

@@ -122,8 +122,8 @@ def claim_notice(path: str, sender: str, nid: int) -> bool:
     today = datetime.now(LA).date().isoformat()
     with conn(path) as c:
         c.execute("BEGIN IMMEDIATE")
-        sent = c.execute("SELECT COUNT(*) FROM notices WHERE sender=? AND status IN ('sending','sent') "
-                         "AND substr(created_at,1,10)=?", (sender, today)).fetchone()[0]
+        sent = c.execute("SELECT COUNT(*) FROM notices WHERE sender=? AND ((status='sent' AND substr(sent_at,1,10)=?) "
+                         "OR (status='sending' AND substr(created_at,1,10)=?))", (sender, today, today)).fetchone()[0]
         ok = sent < MAX_NOTICES_PER_DAY and c.execute(
             "UPDATE notices SET status='sending' WHERE id=? AND sender=? AND status='pending'",
             (nid, sender)).rowcount == 1

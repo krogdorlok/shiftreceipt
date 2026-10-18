@@ -1,5 +1,5 @@
 """LA Fair Work Week rules. Pure functions, integer cents, no I/O, no model output."""
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from models import LA, Answers, ChangeEvent, Coverage, LedgerLine, Shift
 
@@ -111,7 +111,7 @@ def rest_lines(shifts: list[Shift], coverage: Coverage, rate_cents: int,
     for a, b in zip(s, s[1:]):
         if a.day == b.day:
             continue  # split shift in one workday is excluded
-        gap = (b.start_dt() - a.end_dt()).total_seconds() / 60
+        gap = (b.start_dt().astimezone(timezone.utc) - a.end_dt().astimezone(timezone.utc)).total_seconds() / 60
         if gap >= REST_MINUTES:
             continue
         eid = f"rest-{b.day}"

@@ -1,5 +1,5 @@
 """Frozen data contracts. Everyone imports these; change only with team agreement."""
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -26,8 +26,9 @@ class Shift(BaseModel):
         end = datetime.combine(self.day, self.end, LA)
         return end + timedelta(days=1) if self.end <= self.start else end
 
-    def minutes(self) -> int:
-        return int((self.end_dt() - self.start_dt()).total_seconds() // 60)
+    def minutes(self) -> int:  # elapsed time, so DST days count 23/25 h correctly
+        return int((self.end_dt().astimezone(timezone.utc) - self.start_dt().astimezone(timezone.utc))
+                   .total_seconds() // 60)
 
 
 class ScheduleVersion(BaseModel):

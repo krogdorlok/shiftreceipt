@@ -165,4 +165,12 @@ def test_next_week_is_not_a_change_and_edited_reupload_is_new(A):
 
 
 def test_prose_send_is_not_a_send(A):
-    assert "type SEND 7" in say(A, "u", "Do not send receipt 7")
+    assert "type SEND 7" in say(A, "u", "Please send receipt 7")
+    assert "ShiftReceipt checks" in say(A, "u", "Do not send receipt 7")  # negated: not a command at all
+
+
+def test_stale_preview_needs_fresh_receipt(A):
+    nid = re.search(r"reply SEND (\d+)", golden(A, "maria")[-1])[1]
+    data, _ = db.get_profile(A.DB_PATH, "maria")
+    db.update_profile(A.DB_PATH, "maria", notice={**data["notice"], "day": "2026-01-01"})
+    assert "earlier day" in say(A, "maria", f"SEND {nid}")
