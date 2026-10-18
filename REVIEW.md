@@ -1,13 +1,17 @@
 VERDICT: FAIL
-Milestone: M3   Round: 1   Tests: 6 failed, 153 passed in 1.74s
+Milestone: M3   Round: 3   Tests: 3 failed, 161 passed in 2.05s
 ## Findings
-1. [MAJOR] agent.py:427  A start-session message sends attachment metadata but no onboarding question, so a new worker is never asked for the required fields. Also send one prompt listing only missing fields in spec order. Test: tests/review/test_m3_1.py
-2. [MAJOR] agent.py:283  A second schedule replaces pending_vid; confirming it strands the first unconfirmed version, and resending the first says "Already have this one." Keep and present all unconfirmed versions for confirmation, including a resent duplicate. Test: tests/review/test_m3_2.py
-3. [MAJOR] agent.py:390  Multiline commands bypass parser.py's 2,000-character input limit and can cause unbounded database writes from one message. Enforce the limit on the whole text before splitting or running commands. Test: tests/review/test_m3_3.py
-4. [MAJOR] agent.py:296  Each image received during onboarding overwrites the prior image, so only the last schedule survives. Queue images or extract and save each once NAME is known. Test: tests/review/test_m3_4.py
-5. [MAJOR] agent.py:122  An image received after NAME remains only in PENDING_IMAGES until all other fields arrive; a restart loses it despite the required persistent flow. Extract and save shifts as soon as NAME is available. Test: tests/review/test_m3_5.py
-6. [MAJOR] agent.py:292  A duplicate image during onboarding is not recognized because the SHA check looks only in the database. Check the pending image SHA too and reply "Already have this one." Test: tests/review/test_m3_6.py
+1. [BLOCKER] agent.py:215  DROP of the last shift leaves an empty confirmed version, which _events excludes; an eight-hour cancellation disappears and the receipt says $0. Track the dropped version's week and compare that empty version with its predecessor. Test: tests/review/test_m3_7.py
+2. [BLOCKER] agent.py:445  Truncating a 2,001-character paste can turn RATE 200 into RATE 20 and save the wrong hourly rate. Reject oversize messages before parsing or writing any command. Test: tests/review/test_m3_8.py
+3. [MAJOR] agent.py:447  A multiline paste with "HELP" and "Do not send receipt 7" calls send_notice without a typed SEND command, bypassing the single-line gate. Apply the explicit SEND check to each pasted line before run. Test: tests/review/test_m3_9.py
 ## Invariants
-1-8: OK
+1: OK
+2: OK
+3: OK
+4: 3
+5: OK
+6: OK
+7: OK
+8: OK
 ## Disputed tests
 none
