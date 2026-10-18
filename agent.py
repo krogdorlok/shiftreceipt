@@ -595,6 +595,10 @@ def send_notice(sender: str, nid: int) -> list[str]:
     except Exception as e:  # back to pending so the worker can retry; log the cause, never secrets or addresses
         db.finish_notice(DB_PATH, sender, nid, None)
         code = getattr(e, "smtp_code", "") or getattr(getattr(e, "response", None), "status_code", "")
+        try:  # Resend's error name only (its message can contain an address, which is never logged)
+            code = f"{code} {e.response.json().get('name', '')}".strip()
+        except Exception:
+            pass
         missing = [] if os.getenv("RESEND_API_KEY") else [k for k in ("SMTP_USER", "SMTP_APP_PASSWORD") if not os.getenv(k)]
         logging.getLogger("shiftreceipt").error(
             f"notice {nid} not sent: step={step} error={type(e).__name__} code={code} missing_env={missing}")
