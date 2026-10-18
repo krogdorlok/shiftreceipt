@@ -130,3 +130,8 @@ def test_gemini_falls_back_to_interactions(monkeypatch):
                              interactions=SimpleNamespace(create=lambda **kw: SimpleNamespace(output_text=J(row()))))
     monkeypatch.setattr(ex.genai, "Client", lambda **kw: client)
     assert ex._gemini(b"i", "image/png", "p") == J(row())
+
+
+def test_duplicate_rows_collapse(monkeypatch):
+    (shifts, warns), _ = run(monkeypatch, J(row(), row()))
+    assert len(shifts) == 1 and warns == []

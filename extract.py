@@ -21,6 +21,12 @@ MAX_MINUTES = 16 * 60
 HHMM = re.compile(r"([01]?\d|2[0-3]):([0-5]\d)")
 RETRYABLE = (TimeoutError, httpx.TimeoutException, errors.ServerError)
 
+
+def _retryable(e: Exception) -> bool:
+    """Timeouts and 5xx from either SDK surface (the interactions API has its own error classes)."""
+    code = getattr(e, "status_code", None) or getattr(e, "code", None)
+    return isinstance(e, RETRYABLE) or (isinstance(code, int) and code >= 500)
+
 PROMPT = """Extract work shifts from this schedule image.
 Only extract the shifts for the person named "{name}". If the screen shows one person's schedule, use it.
 Ignore days marked Off. Use 24-hour times HH:MM. Set ambiguous=true if AM/PM or the date is unclear; never guess.
@@ -42,7 +48,9 @@ class Extraction(BaseModel):
 
 
 def _gemini(data: bytes, mime: str, prompt: str) -> str:
-    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"), http_options=types.HttpOptions(timeout=TIMEOUT_MS))
+    # SDK-internal retries off: extract() does exactly one retry itself
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"), http_options=types.HttpOptions(
+        timeout=TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=1)))
     model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     try:
         return client.models.generate_content(
@@ -50,6 +58,10 @@ def _gemini(data: bytes, mime: str, prompt: str) -> str:
             config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Extraction,
                                                temperature=0)).text
     except (TypeError, AttributeError):  # SDK shape changed: try the interactions API
+        try:  # its own retry config ignores HttpRetryOptions (4 tries by default); turn it off
+            client.interactions.sdk_configuration.retry_config = None
+        except AttributeError:
+            pass
         r = client.interactions.create(
             model=model, timeout=TIMEOUT_MS / 1000,
             input=[{"type": "image", "data": base64.b64encode(data).decode(), "mime_type": mime},
@@ -87,7 +99,8 @@ def _post(rows: list[Row], ref_date: date) -> tuple[list[Shift], list[str]]:
         if s == e or shift.minutes() > MAX_MINUTES:
             warnings.append(f"impossible length: {label}")
             continue
-        shifts.append(shift)
+        if shift not in shifts:  # the model sometimes repeats a row; a duplicate would make the day "needs review"
+            shifts.append(shift)
     return sorted(shifts, key=lambda x: x.start_dt()), warnings
 
 
@@ -98,8 +111,8 @@ def extract(image_bytes: bytes, mime: str, worker_name: str, ref_date: date) -> 
             try:
                 text = _gemini(image_bytes, mime, prompt)
                 break
-            except RETRYABLE:
-                if attempt:
+            except Exception as e:
+                if attempt or not _retryable(e):
                     return [], ["unreadable"]
         rows = Extraction.model_validate_json(text or "").shifts
         return _post(rows, ref_date) if rows else ([], ["unreadable"])  # not a schedule
