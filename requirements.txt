@@ -1,0 +1,6 @@
+pydantic>=2.7
+pytest>=8
+uagents>=0.26
+google-genai>=2.0
+httpx>=0.27
+pypdf>=5
