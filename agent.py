@@ -15,6 +15,7 @@ from uuid import uuid4
 import httpx
 from dotenv import load_dotenv
 from uagents import Agent, Context, Protocol
+from uagents_core.types import DeliveryStatus
 from uagents_core.contrib.protocols.chat import (ChatAcknowledgement, ChatMessage, MetadataContent,
                                                  ResourceContent, StartSessionContent, TextContent,
                                                  chat_protocol_spec)
@@ -118,14 +119,29 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+RETRY_DELAYS = (2, 5)  # seconds; Agentverse's relay sometimes answers 503 for a moment
+
+
+async def _deliver(ctx: Context, to: str, msg: ChatMessage) -> None:
+    """Send, and retry the same message (same msg_id, so it is never shown twice) if delivery failed."""
+    for delay in (0,) + RETRY_DELAYS:
+        if delay:
+            await asyncio.sleep(delay)
+        status = await ctx.send(to, msg)
+        if getattr(status, "status", None) != DeliveryStatus.FAILED:
+            return
+        ctx.logger.warning(f"reply {msg.msg_id} not delivered, retrying")
+    ctx.logger.error(f"reply {msg.msg_id} not delivered after {1 + len(RETRY_DELAYS)} tries")
+
+
 async def reply(ctx: Context, to: str, item: "str | MetadataContent") -> None:
     if isinstance(item, MetadataContent):  # a card: always sent after its text, and never breaks the flow
         try:
-            await ctx.send(to, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[item]))
+            await _deliver(ctx, to, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[item]))
         except Exception as e:
             ctx.logger.error(f"card failed: {type(e).__name__}")
         return
-    await ctx.send(to, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[TextContent(type="text", text=item)]))
+    await _deliver(ctx, to, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[TextContent(type="text", text=item)]))
 
 
 # ---- M3 worker flow. Sync on purpose: the handler runs it in asyncio.to_thread (db, Gemini). ----

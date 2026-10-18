@@ -255,3 +255,23 @@ def test_first_message_gets_greeting_and_steps(A):
     assert r.startswith("**Hi, I am ShiftReceipt.**") and "1. Set up once" in r and "5. I show a receipt" in r
     assert "To set up" in r and "could not read" not in r
     assert "Hi, I am ShiftReceipt" not in say(A, "new", "NAME Ana")  # only once
+
+
+def test_failed_reply_is_retried_with_the_same_message(A, monkeypatch):
+    from types import SimpleNamespace
+    from uagents_core.types import DeliveryStatus
+
+    async def no_wait(_):
+        return None
+    monkeypatch.setattr(A.asyncio, "sleep", no_wait)
+
+    class Flaky(Ctx):
+        async def send(self, to, m):
+            self.out.append((to, m))
+            fails = len(self.out) <= 2  # relay down for the first two tries
+            return SimpleNamespace(status=DeliveryStatus.FAILED if fails else DeliveryStatus.DELIVERED)
+
+    ctx = Flaky()
+    asyncio.run(A.reply(ctx, "u", "hello"))
+    ids = {m.msg_id for _, m in ctx.out}
+    assert len(ctx.out) == 3 and len(ids) == 1  # retried twice, same message id each time
