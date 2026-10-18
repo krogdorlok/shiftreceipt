@@ -39,6 +39,13 @@ def diff(prev: ScheduleVersion, curr: ScheduleVersion) -> list[ChangeEvent]:
                                   old=old, new=new, learned_at=curr.learned_at, minutes_delta=delta))
 
     days = sorted(set(p) | set(c))
+    changed = [d for d in days if sorted(map(repr, p.get(d, []))) != sorted(map(repr, c.get(d, [])))]
+    key = lambda s: (s.start, s.end, (s.location or "").strip().lower())
+    week = lambda d: d.isocalendar()[:2]
+
+    def elsewhere(d, shifts_by_day):  # shift shapes on other changed days of the same week
+        return {key(s) for o in changed if o != d and week(o) == week(d) for s in shifts_by_day.get(o, [])}
+
     removed, added = [], []
     for d in days:
         olds, news = p.get(d, []), c.get(d, [])
@@ -47,7 +54,9 @@ def diff(prev: ScheduleVersion, curr: ScheduleVersion) -> list[ChangeEvent]:
                 add(d, "needs_review")
         elif olds and news:
             kind = _same_day_kind(olds[0], news[0])
-            if kind:
+            if kind and (key(news[0]) in elsewhere(d, p) or key(olds[0]) in elsewhere(d, c)):
+                add(d, "needs_review", olds[0], news[0])  # shifts may have swapped days: pairing is a guess
+            elif kind:
                 add(d, kind, olds[0], news[0])
         elif olds:
             removed.append(olds[0])
@@ -56,7 +65,7 @@ def diff(prev: ScheduleVersion, curr: ScheduleVersion) -> list[ChangeEvent]:
 
     # A shift moved to another day in the same week is one "moved" event, not cancel + add, but only when the
     # pairing is certain: exactly one shift left the week and one arrived, same length.
-    wk = lambda s: s.day.isocalendar()[:2]
+    wk = lambda s: week(s.day)
     for w in {wk(o) for o in removed} & {wk(n) for n in added}:
         olds, news = [o for o in removed if wk(o) == w], [n for n in added if wk(n) == w]
         if len(olds) == len(news) == 1 and olds[0].minutes() == news[0].minutes():

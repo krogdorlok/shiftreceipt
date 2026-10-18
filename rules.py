@@ -61,7 +61,7 @@ def missing_answers(events: list[ChangeEvent], answers: dict[str, Answers]) -> l
     """(event_id, field) pairs the agent must still ask about, late payable events only."""
     out = []
     for e in events:
-        if e.kind == "needs_review" or not is_late(e):
+        if e.kind == "needs_review" or (e.kind == "moved" and not changes(e)) or not is_late(e):
             continue
         a = answers.get(e.id, Answers())
         out += [(e.id, f) for f in _required(e) if getattr(a, f) is None]
