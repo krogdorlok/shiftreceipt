@@ -26,3 +26,14 @@ end==start, >16 h, ambiguous rows (named in warnings), duplicate rows; empty out
 One retry on timeout/5xx, SDK-internal retries off. CLI: python extract.py img.png "Maria Lopez".
 Needs human check: GEMINI_API_KEY in .env, run the CLI on assets/demo v1, v2, v3, team_two_people (only Maria's
 3 shifts) and not_a_schedule (unreadable); output must match fixtures/v1..v3.json.
+
+## Spec changes approved by the human (City guidance, Oct 18 5:10 AM; these override prompts/M3-M5.md)
+- Receipt: "Total that may be owed" is split into "Schedule change pay that may be owed" (R2/R3/R4) and
+  "Rest premium that may be owed, only for shifts you actually work" (R6), then "Estimated total: $X. This is an
+  estimate, not unpaid wages yet: predictability pay is due on the payday for the pay period of the change."
+  Golden script: $70.00 + $80.00, Estimated total $150.00.
+- Notice: created only from rules.due_lines (rest premium only for past shifts); shown as a preview with
+  "Check your paycheck for that pay period first" before the SEND prompt.
+- Cure period: "15 days from receiving it" (City FAQ 65), never a fixed date presented as the deadline.
+- Notice PDF: "Advance Notice of Work Schedule" is never ticked automatically (the form alleges no 14-day notice
+  or no chance to decline, which a late change alone does not show).
