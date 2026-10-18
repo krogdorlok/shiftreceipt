@@ -332,7 +332,7 @@ def receipt(sender: str) -> list[str]:
         out += ["", f"Notice preview ({nid}): {data['employer']} may owe {data['name']} {usd(rules.total(due))} "
                     "under the LA Fair Work Week Ordinance for:"]
         out += [f"- {s['day']} {s['change']}: {usd(s['cents'])}" for s in saved if s["event_id"] in keep]
-        out += ["Check your paycheck for that pay period first. If the pay is missing, reply SEND "
+        out += ["", "Check your paycheck for that pay period first. If the pay is missing, reply SEND "
                 f"{nid} to email the official Notice to Cure to {data['manager']}. Your employer then has 15 days "
                 "from receiving it to fix this."]
     elif tot:
