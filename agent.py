@@ -16,6 +16,7 @@ from uagents_core.contrib.protocols.chat import (ChatAcknowledgement, ChatMessag
                                                  chat_protocol_spec)
 
 import db
+import notice
 import rules
 from diff import diff
 from extract import extract, schedule_text
@@ -291,7 +292,9 @@ def receipt(sender: str) -> list[str]:
     if due:
         # ponytail: a new pending notice per receipt; claim_notice's daily cap limits what can actually be sent
         keep = {l.event_id for l in due}
-        nid = db.create_notice(DB_PATH, sender, [s for s in saved if s["event_id"] in keep], rules.total(due))
+        due_saved = [s for s in saved if s["event_id"] in keep]
+        nid = db.create_notice(DB_PATH, sender, due_saved, rules.total(due))
+        db.update_profile(DB_PATH, sender, notice={"id": nid, "lines": due_saved})
         out += ["", f"Notice preview ({nid}): {data['employer']} may owe {data['name']} {usd(rules.total(due))} "
                     "under the LA Fair Work Week Ordinance for:"]
         out += [f"- {s['day']} {s['change']}: {usd(s['cents'])}" for s in saved if s["event_id"] in keep]
@@ -480,7 +483,25 @@ def handle_text(sender: str, text: str) -> list[str]:
 
 
 def send_notice(sender: str, nid: int) -> list[str]:
-    return ["Sending notices arrives in the next update."]  # M4
+    """Only the latest notice preview, only for its owner, only once (db.claim_notice is atomic and capped)."""
+    data, _ = db.get_profile(DB_PATH, sender)
+    pending = data.get("notice") or {}
+    if pending.get("id") != nid or not db.claim_notice(DB_PATH, sender, nid):
+        return ["That notice is not pending or the daily limit is reached."]
+    now = datetime.now(LA)
+    note = "Schedules: " + "; ".join(
+        f"got {v.learned_at.astimezone(LA).date()} ({'worker-stated' if v.learned_source == 'worker' else 'upload date'})"
+        f", uploaded {v.received_at.astimezone(LA).date()}" for v in db.versions(DB_PATH, sender)) + "."
+    try:
+        pdf = notice.render_notice({**data, "schedule_note": note}, pending["lines"], now.date())
+        mid = notice.send(data["manager"], pdf, data["name"])
+    except Exception:  # SMTP, auth, PDF: back to pending so the worker can retry; never echo the error
+        db.finish_notice(DB_PATH, sender, nid, None)
+        return [f"Not sent. Try SEND {nid} again."]
+    db.finish_notice(DB_PATH, sender, nid, mid)
+    return [f"Sent {_t(now.time())} to {data['manager']}. Your employer has 15 calendar days from receiving it to "
+            f"fix this (until {_d(rules.cure_deadline(now))} if they receive it today). If not, you can file a "
+            "complaint with OWS: wagesla.lacity.gov/complaint. Not legal advice."]
 
 
 chat = Protocol(spec=chat_protocol_spec)
