@@ -133,7 +133,7 @@ def test_edit_drop_got_and_unknown(A):
     assert "No shift" in say(A, "u", "DROP 2026-10-22")
     assert "future" in say(A, "u", "GOT 2099-01-01")
     assert "got on Sat Oct 3" in say(A, "u", "GOT 2026-10-03")
-    assert "ShiftReceipt checks" in say(A, "u", "what is this?")
+    assert "could not read" in say(A, "u", "what is this?") and "Then CONFIRM" in say(A, "u", "what is this?2")
     assert "No open questions" in say(A, "u", "Q9 yes")
 
 
@@ -223,3 +223,11 @@ def test_missing_keywords_get_a_copyable_block(A):
     assert "I could not read: RATE 20 Case" in r
     assert "```\nEMPLOYER Big Retail Co\nRATE 20\n" not in r and "EMPLOYER Big Retail Co" in r and "COVER yes yes yes" in r
     assert say(A, "u", "@shiftreceipt hi").startswith("I could not read that.")
+
+
+def test_unreadable_text_gets_a_hint_for_where_you_are(A):
+    nid = re.search(r"reply SEND (\d+)", golden(A, "maria")[-1])[1]
+    assert f"To email notice {nid}, type SEND {nid}." in say(A, "maria", AT + nid)
+    assert f"Did you mean: SEND {nid}" in say(A, "maria", f"SNED {nid}")
+    say(A, "maria", schedule_text(fixture("v3")))
+    assert "Then CONFIRM" in say(A, "maria", "ok")

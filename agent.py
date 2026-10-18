@@ -1,5 +1,6 @@
 """ShiftReceipt agent: ASI:One Chat Protocol front end and the worker flow (state per sender in SQLite)."""
 import asyncio
+import difflib
 import hashlib
 import json
 import os
@@ -513,6 +514,32 @@ def welcome(sender: str) -> str:
     return "Welcome back. Send your newest schedule, or RECEIPT to see your receipt."
 
 
+COMMANDS = ["SEND", "CONFIRM", "RECEIPT", "GOT", "EDIT", "DROP", "HELP", "SCHEDULE", "RESET", "OT", "NAME", "RATE",
+            "EMPLOYER", "TITLE", "STORE", "MANAGER", "COVER"]
+
+
+def _hint(sender: str, data: dict, text: str) -> str:
+    """Unreadable text: say so, guess the command they meant, and point to the next step for where they are."""
+    words = text.split()
+    out = [f'I could not read "{text.strip()[:40]}".']
+    guess = difflib.get_close_matches(words[0].upper(), COMMANDS, n=1, cutoff=0.6) if words else []
+    if guess and guess[0] != words[0].upper():
+        out.append(f"Did you mean: {' '.join([guess[0]] + words[1:])}")
+    notice = data.get("notice") or {}
+    still = _open(sender, data.get("questions", {}))
+    if notice and text.strip() == str(notice.get("id")):
+        out.append(f"To email notice {notice['id']}, type SEND {notice['id']}.")
+    elif still:
+        out.append(f"Open questions: {', '.join('Q' + k for k in still)}. Reply e.g. Q{next(iter(still))} no.")
+    elif _pending(sender, data):
+        out.append(FOOTER)
+    elif notice:
+        out.append(f"To email notice {notice['id']}, type SEND {notice['id']}. RECEIPT shows the receipt again.")
+    else:
+        out.append("Send a new schedule screenshot, or RECEIPT to see your receipt. HELP explains everything.")
+    return "\n".join(out)
+
+
 def _prose_send(text: str, c) -> list[str] | None:
     """Invariant 4: only a typed SEND <id> or a card click sends; prose like "do not send receipt 7" never does."""
     if c and c.name == "SEND" and not (_strict(text) or _from_json(text)):
@@ -543,7 +570,7 @@ def handle_text(sender: str, text: str) -> list[str]:
         data, _ = db.get_profile(DB_PATH, sender)
         if m := _missing(data):
             return ["I could not read that.\n" + _setup_prompt(m)]
-        return [HELP_TEXT]
+        return [_hint(sender, data, text)]
     return run(sender, c)
 
 
