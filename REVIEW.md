@@ -1,8 +1,7 @@
 VERDICT: FAIL
-Milestone: CORE-FIX   Round: 2   Tests: 2 failed, 95 passed in 0.12s
+Milestone: CORE-FIX   Round: 3   Tests: 1 failed, 97 passed in 0.13s
 ## Findings
-1. [BLOCKER] diff.py:48  Two five-hour shifts swapping days are paired by day, producing $80 for time and location changes when pairing by shift produces $40 for date changes. Detect ambiguous cross-day matches before same-day pairing and mark affected changes needs_review. Test: tests/review/test_core_fix_4.py
-2. [MAJOR] rules.py:64  A move with no countable change is needs_review, but missing_answers still asks employee_requested and can stall the receipt. Skip these moves in missing_answers as evaluate does. Test: tests/review/test_core_fix_3.py
+1. [BLOCKER] diff.py:52  When one of two Monday shifts moves to Tuesday, Monday is marked needs_review but Tuesday is paid as a new shift ($20 in the test); the actual date and location move would be $40. Carry unmatched shifts from multi-shift days into same-week ambiguity detection and mark the possible counterpart needs_review. Test: tests/review/test_core_fix_5.py
 ## Invariants
 1-8: OK
 ## Disputed tests
