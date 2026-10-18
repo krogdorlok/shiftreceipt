@@ -121,3 +121,27 @@ def test_send_auth_error_is_not_retried_on_587(monkeypatch, smtp):
     monkeypatch.setattr(notice.smtplib, "SMTP", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no retry")))
     with pytest.raises(smtplib.SMTPAuthenticationError):
         notice.send("boss@example.com", b"%PDF", "Maria Lopez")
+
+
+def test_send_over_https_when_resend_key_set(monkeypatch):
+    import httpx
+    seen = {}
+
+    def post(url, headers, timeout, json):
+        seen.update(url=url, auth=headers["Authorization"], json=json)
+        return httpx.Response(200, json={"id": "re_123"}, request=httpx.Request("POST", url))
+    monkeypatch.setenv("RESEND_API_KEY", "re_test")
+    monkeypatch.setattr(notice.httpx, "post", post)
+    monkeypatch.setattr(notice.smtplib, "SMTP_SSL", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no smtp")))
+    assert notice.send("boss@example.com", b"%PDF", "Maria Lopez") == "re_123"
+    assert seen["url"] == "https://api.resend.com/emails" and seen["auth"] == "Bearer re_test"
+    assert seen["json"]["to"] == ["boss@example.com"] and seen["json"]["attachments"][0]["filename"] == "Notice_to_Cure.pdf"
+    assert "15 calendar days from receipt" in seen["json"]["text"]
+
+
+def test_https_error_raises(monkeypatch):
+    import httpx
+    monkeypatch.setenv("RESEND_API_KEY", "re_test")
+    monkeypatch.setattr(notice.httpx, "post", lambda url, **k: httpx.Response(403, request=httpx.Request("POST", url)))
+    with pytest.raises(httpx.HTTPStatusError):
+        notice.send("boss@example.com", b"%PDF", "Maria Lopez")

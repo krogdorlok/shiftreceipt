@@ -1,4 +1,5 @@
 """Fill the official OWS Notice to Cure template and email it. Factual only: amounts come from rules.py lines."""
+import base64
 import io
 import os
 import smtplib
@@ -8,6 +9,7 @@ from email.message import EmailMessage
 from email.utils import make_msgid
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import NameObject, NumberObject, TextStringObject
@@ -70,17 +72,26 @@ def render_notice(profile: dict, lines: list[dict], sent_date: date) -> bytes:
 
 
 def send(to: str, pdf_bytes: bytes, worker_name: str) -> str:
-    """Returns the Message-ID. Raises on any SMTP failure (caller puts the notice back to pending)."""
+    """Returns the message id. Raises on any failure (caller puts the notice back to pending).
+    RESEND_API_KEY set: send over HTTPS (works where networks block mail ports). Otherwise Gmail SMTP."""
+    subject = f"Notice to Cure under the LA Fair Work Week Ordinance - {worker_name}"
+    body = (f"Attached is a Notice to Cure from {worker_name}, sent at their request.\n\n"
+            "Under the City of Los Angeles Fair Work Week Ordinance, the employer has 15 calendar days from receipt "
+            "of this notice to cure the alleged violations described in the attached Statement of Facts.\n\n"
+            "This notice was prepared with ShiftReceipt.")
+    if key := os.getenv("RESEND_API_KEY"):
+        r = httpx.post("https://api.resend.com/emails", headers={"Authorization": f"Bearer {key}"}, timeout=20, json={
+            "from": os.getenv("RESEND_FROM") or "ShiftReceipt <onboarding@resend.dev>", "to": [to],
+            "subject": subject, "text": body,
+            "attachments": [{"filename": "Notice_to_Cure.pdf", "content": base64.b64encode(pdf_bytes).decode()}]})
+        r.raise_for_status()
+        return r.json()["id"]
     user, password = os.environ["SMTP_USER"], os.environ["SMTP_APP_PASSWORD"]
     msg = EmailMessage()
-    msg["Subject"] = f"Notice to Cure under the LA Fair Work Week Ordinance - {worker_name}"
+    msg["Subject"] = subject
     msg["From"], msg["To"] = user, to
     msg["Message-ID"] = make_msgid(domain=user.split("@")[-1])
-    msg.set_content(
-        f"Attached is a Notice to Cure from {worker_name}, sent at their request.\n\n"
-        "Under the City of Los Angeles Fair Work Week Ordinance, the employer has 15 calendar days from receipt "
-        "of this notice to cure the alleged violations described in the attached Statement of Facts.\n\n"
-        "This notice was prepared with ShiftReceipt.")
+    msg.set_content(body)
     msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename="Notice_to_Cure.pdf")
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:

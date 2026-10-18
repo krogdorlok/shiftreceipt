@@ -594,10 +594,10 @@ def send_notice(sender: str, nid: int) -> list[str]:
         mid = notice.send(data["manager"], pdf, data["name"])
     except Exception as e:  # back to pending so the worker can retry; log the cause, never secrets or addresses
         db.finish_notice(DB_PATH, sender, nid, None)
-        code = getattr(e, "smtp_code", "")
-        missing = [k for k in ("SMTP_USER", "SMTP_APP_PASSWORD") if not os.getenv(k)]
+        code = getattr(e, "smtp_code", "") or getattr(getattr(e, "response", None), "status_code", "")
+        missing = [] if os.getenv("RESEND_API_KEY") else [k for k in ("SMTP_USER", "SMTP_APP_PASSWORD") if not os.getenv(k)]
         logging.getLogger("shiftreceipt").error(
-            f"notice {nid} not sent: step={step} error={type(e).__name__} smtp_code={code} missing_env={missing}")
+            f"notice {nid} not sent: step={step} error={type(e).__name__} code={code} missing_env={missing}")
         return [f"Not sent. Try SEND {nid} again."]
     db.finish_notice(DB_PATH, sender, nid, mid)
     return [f"Sent {_t(now.time())} to {data['manager']}. Your employer has 15 calendar days from receiving it to "

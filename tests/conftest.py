@@ -30,3 +30,9 @@ def fixture(name):
 @pytest.fixture
 def demo():
     return V(1, fixture("v1"), "2026-10-04T10:00"), V(2, fixture("v2"), "2026-10-18T09:00"), V(3, fixture("v3"), "2026-10-19T08:00")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_email(monkeypatch):
+    """.env is loaded on import; tests must never use a real email key."""
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
