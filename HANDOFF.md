@@ -14,3 +14,4 @@ Human approved the fix (Oct 18, 5:15 AM). Fixed on branch core-fix, spec prompts
 none
 
 CORE-FIX round 4 approved by the human (Oct 18) after round 3 FAIL: a week with a changed multi-shift day is all needs_review.
+Final rule (human said "do it", Oct 18 5:40 AM, no 5th round): 2+ days in a week with a changed start/location are needs_review. Merged without a Codex PASS; round 4 test passes. M3 review re-checks diff.py/rules.py.

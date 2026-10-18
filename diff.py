@@ -45,6 +45,12 @@ def diff(prev: ScheduleVersion, curr: ScheduleVersion) -> list[ChangeEvent]:
     key = lambda s: (s.start, s.end, (s.location or "").strip().lower())
     week = lambda d: d.isocalendar()[:2]
     unclear_weeks = {week(d) for d in changed if len(p.get(d, [])) > 1 or len(c.get(d, [])) > 1}
+    # Days whose single shift changed start or location could be shifts trading days. One such day in a week is
+    # a plain move; two or more could be a swap, so those days are not priced. End-only changes stay priced.
+    shape = lambda s: (s.start, (s.location or "").strip().lower())
+    starts_moved = [d for d in changed if len(p.get(d, [])) == len(c.get(d, [])) == 1
+                    and shape(p[d][0]) != shape(c[d][0])]
+    swap_days = {d for d in starts_moved if sum(week(o) == week(d) for o in starts_moved) > 1}
 
     def elsewhere(d, shifts_by_day):  # shift shapes on other changed days of the same week
         return {key(s) for o in changed if o != d and week(o) == week(d) for s in shifts_by_day.get(o, [])}
@@ -57,7 +63,7 @@ def diff(prev: ScheduleVersion, curr: ScheduleVersion) -> list[ChangeEvent]:
                 add(d, "needs_review")
         elif olds and news:
             kind = _same_day_kind(olds[0], news[0])
-            if kind and (key(news[0]) in elsewhere(d, p) or key(olds[0]) in elsewhere(d, c)):
+            if kind and (d in swap_days or key(news[0]) in elsewhere(d, p) or key(olds[0]) in elsewhere(d, c)):
                 add(d, "needs_review", olds[0], news[0])  # shifts may have swapped days: pairing is a guess
             elif kind:
                 add(d, kind, olds[0], news[0])
