@@ -86,8 +86,8 @@ def send(to: str, pdf_bytes: bytes, worker_name: str) -> str:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
             s.login(user, password)
             s.send_message(msg)
-    except OSError as e:  # some networks block 465 but allow 587 (auth errors are not OSError: no retry)
-        if isinstance(e, smtplib.SMTPException):
+    except OSError as e:  # 465 blocked or dropped: try 587 once. Auth and other SMTP replies are not retried.
+        if isinstance(e, smtplib.SMTPException) and not isinstance(e, smtplib.SMTPServerDisconnected):
             raise
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as s:
             s.starttls()
