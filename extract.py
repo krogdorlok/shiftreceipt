@@ -34,7 +34,7 @@ class Row(BaseModel):
     start: str
     end: str
     location: str | None = None
-    ambiguous: bool = False
+    ambiguous: bool  # required: a row without it is malformed, not certain
 
 
 class Extraction(BaseModel):
@@ -54,6 +54,7 @@ def _gemini(data: bytes, mime: str, prompt: str) -> str:
             model=model, timeout=TIMEOUT_MS / 1000,
             input=[{"type": "image", "data": base64.b64encode(data).decode(), "mime_type": mime},
                    {"type": "text", "text": prompt}],
+            response_mime_type="application/json",
             response_format={"mime_type": "application/json", "schema": Extraction.model_json_schema()})
         return r.output_text
 
@@ -100,7 +101,8 @@ def extract(image_bytes: bytes, mime: str, worker_name: str, ref_date: date) -> 
             except RETRYABLE:
                 if attempt:
                     return [], ["unreadable"]
-        return _post(Extraction.model_validate_json(text or "").shifts, ref_date)
+        rows = Extraction.model_validate_json(text or "").shifts
+        return _post(rows, ref_date) if rows else ([], ["unreadable"])  # not a schedule
     except Exception:  # bad JSON, auth, quota, anything: the worker gets the typed fallback
         return [], ["unreadable"]
 

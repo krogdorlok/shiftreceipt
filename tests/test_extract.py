@@ -50,6 +50,7 @@ def test_invalid_json(monkeypatch):
     assert run(monkeypatch, "not json {")[0] == ([], ["unreadable"])
     assert run(monkeypatch, json.dumps({"shifts": [{"month": 13}]}))[0] == ([], ["unreadable"])
     assert run(monkeypatch, None)[0] == ([], ["unreadable"])
+    assert run(monkeypatch, J())[0] == ([], ["unreadable"])  # not a schedule
 
 
 def test_timeout_then_success(monkeypatch):
