@@ -34,6 +34,8 @@ def diff(prev: ScheduleVersion, curr: ScheduleVersion) -> list[ChangeEvent]:
     events: list[ChangeEvent] = []
 
     def add(day, kind, old=None, new=None):
+        if week(day) in unclear_weeks:  # a multi-shift day changed: any pairing in this week is a guess
+            kind = "needs_review"
         delta = (new.minutes() if new else 0) - (old.minutes() if old else 0)
         events.append(ChangeEvent(id=f"{prev.id}-{curr.id}-{day}-{kind}", day=day, kind=kind,
                                   old=old, new=new, learned_at=curr.learned_at, minutes_delta=delta))
@@ -42,6 +44,7 @@ def diff(prev: ScheduleVersion, curr: ScheduleVersion) -> list[ChangeEvent]:
     changed = [d for d in days if sorted(map(repr, p.get(d, []))) != sorted(map(repr, c.get(d, [])))]
     key = lambda s: (s.start, s.end, (s.location or "").strip().lower())
     week = lambda d: d.isocalendar()[:2]
+    unclear_weeks = {week(d) for d in changed if len(p.get(d, [])) > 1 or len(c.get(d, [])) > 1}
 
     def elsewhere(d, shifts_by_day):  # shift shapes on other changed days of the same week
         return {key(s) for o in changed if o != d and week(o) == week(d) for s in shifts_by_day.get(o, [])}

@@ -12,3 +12,5 @@ Human approved the fix (Oct 18, 5:15 AM). Fixed on branch core-fix, spec prompts
 
 ## Disputed review tests
 none
+
+CORE-FIX round 4 approved by the human (Oct 18) after round 3 FAIL: a week with a changed multi-shift day is all needs_review.
