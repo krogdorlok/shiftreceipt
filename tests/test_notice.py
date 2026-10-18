@@ -80,6 +80,7 @@ def nid_of(text):
 
 def test_send_flow_failure_retry_and_double_send(A, smtp):
     nid = nid_of(golden(A, "maria")[-1])
+    say(A, "maria", "SIGN TYPED")
     smtp.fail = True
     r = say(A, "maria", f"SEND {nid}")
     assert r == f"Not sent. Try SEND {nid} again." and smtp.sent == []
@@ -145,3 +146,61 @@ def test_https_error_raises(monkeypatch):
     monkeypatch.setattr(notice.httpx, "post", lambda url, **k: httpx.Response(403, request=httpx.Request("POST", url)))
     with pytest.raises(httpx.HTTPStatusError):
         notice.send("boss@example.com", b"%PDF", "Maria Lopez")
+
+
+def signature_photo(shadow=True) -> bytes:
+    """A phone-like photo: dark pen strokes on paper with an uneven shadow, saved as JPEG."""
+    from PIL import Image, ImageDraw
+    img = Image.new("L", (900, 600), 235)
+    if shadow:
+        img = Image.linear_gradient("L").resize((900, 600)).point(lambda v: 235 - v // 4)
+    d = ImageDraw.Draw(img)
+    d.line([(150, 330), (230, 260), (300, 350), (380, 250), (470, 340), (560, 270), (650, 330)], fill=40, width=8)
+    d.line([(160, 380), (700, 370)], fill=50, width=5)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=80)
+    return buf.getvalue()
+
+
+def test_clean_signature_removes_background_and_rejects_non_signatures():
+    from PIL import Image
+    png = Image.open(io.BytesIO(notice.clean_signature(signature_photo())))
+    assert png.mode == "RGBA" and png.getpixel((0, 0))[3] == 0 and png.getchannel("A").getextrema()[1] == 255
+    blank = io.BytesIO()
+    Image.new("RGB", (800, 500), (238, 238, 238)).save(blank, "JPEG")
+    for bad in (blank.getvalue(), open(notice.TEMPLATE.parent / "demo" / "v1_posted_oct3.png", "rb").read(), b"junk"):
+        with pytest.raises(Exception):
+            notice.clean_signature(bad)
+
+
+def test_render_places_signature_image_instead_of_typed_name():
+    png = notice.clean_signature(signature_photo())
+    pdf = notice.render_notice(PROFILE, LINES, date(2026, 10, 18), png)
+    f = fields(pdf)
+    assert f[notice.F_SIGN] in ("", None) and f["Print Name"] == "Maria Lopez"
+    xobjects = PdfReader(io.BytesIO(pdf)).pages[1]["/Resources"]["/XObject"]
+    assert any("/SMask" in x.get_object() for x in xobjects.values())  # transparent image on page 2
+
+
+def test_send_asks_for_signature_then_uses_it_once(A, smtp):
+    say(A, "maria", "NAME Maria Lopez")  # first message
+    golden(A, "maria")
+    assert "please sign" in say(A, "maria", "SEND 1") and smtp.sent == []
+    assert "could not find a signature" in "\n".join(
+        A.handle_image("maria", open(notice.TEMPLATE.parent / "demo" / "v1_posted_oct3.png", "rb").read(), "image/png"))
+    assert "Signature received" in "\n".join(A.handle_image("maria", signature_photo(), "image/jpeg"))
+    assert "maria" in A.SIGNATURES
+    profile_json = str(db.get_profile(A.DB_PATH, "maria")[0])
+    assert "PNG" not in profile_json and len(profile_json) < 5000  # the image never reaches the database
+    assert say(A, "maria", "SEND 1").startswith("Sent") and len(smtp.sent) == 1
+    pdf = smtp.sent[0].get_payload()[1].get_content()
+    assert fields(pdf)[notice.F_SIGN] in ("", None)
+    assert "maria" not in A.SIGNATURES  # used once, then gone
+
+
+def test_sign_typed_uses_typed_name(A, smtp):
+    golden(A, "maria")
+    assert "please sign" in say(A, "maria", "SEND 1")
+    assert "typed name will sign" in say(A, "maria", "SIGN TYPED")
+    assert say(A, "maria", "SEND 1").startswith("Sent")
+    assert fields(smtp.sent[0].get_payload()[1].get_content())[notice.F_SIGN] == "Maria Lopez (typed)"

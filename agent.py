@@ -148,7 +148,11 @@ GREETING = ("**Hi, I am ShiftReceipt.** I help retail workers in the City of Los
             "2. Send a screenshot of the schedule you were given, or type it.  \n"
             "3. Tell me the day you got it (GOT YYYY-MM-DD), then reply CONFIRM.  \n"
             "4. When your schedule changes, send the new one the same way and answer a few yes/no questions.  \n"
-            "5. I show a receipt. If pay may be owed, SEND 1 emails the official notice to your manager.")
+            "5. I show a receipt. If pay may be owed, you sign and SEND 1 emails the official notice to your manager.")
+SIGN_ASK = ("Before I send it, please sign: write your signature with a dark pen on plain white paper and attach a "
+            "close photo of it. I remove the background and place it on the form. The photo is used only for this "
+            "notice and is never stored. Prefer not to? Reply SIGN TYPED to sign with your typed name.")
+SIGNATURES: dict[str, bytes] = {}  # cleaned signature PNG per sender, memory only until the notice is sent
 NOTICE_ALIAS = 1  # the worker always types SEND 1: it means "my current notice", whatever its row id is
 STEPS = [("name", "NAME your full name, e.g. NAME Maria Lopez"),
          ("rate", "RATE your hourly pay, e.g. RATE 20"),
@@ -421,7 +425,24 @@ def _new_version(sender: str, sha: str, shifts: list[Shift], warnings: list[str]
     return [_show(_pending(sender, data), warnings)]
 
 
+def handle_signature(sender: str, data: bytes) -> list[str]:
+    try:
+        SIGNATURES[sender] = notice.clean_signature(data)
+    except Exception:  # ValueError (not a signature) or an unreadable image
+        return ["I could not find a signature in that photo. Sign with a dark pen on plain white paper and send a "
+                "close, well lit photo. Or reply SIGN TYPED to sign with your typed name."]
+    db.update_profile(DB_PATH, sender, sign_wait=False)
+    return [f"Signature received: background removed, ready for the form. Reply SEND {NOTICE_ALIAS} to email the "
+            "notice."]
+
+
+def waiting_for_signature(sender: str) -> bool:
+    return bool(db.get_profile(DB_PATH, sender)[0].get("sign_wait"))
+
+
 def handle_image(sender: str, data: bytes, mime: str) -> list[str]:
+    if waiting_for_signature(sender):
+        return handle_signature(sender, data)
     sha = hashlib.sha256(data).hexdigest()
     if (known := _known(sender, sha)) is not None:
         return known
@@ -478,6 +499,7 @@ def run(sender: str, c) -> list[str]:
             return ["RESET is only available on demo accounts."]
         db.reset(DB_PATH, sender)
         PENDING_IMAGES.pop(sender, None)
+        SIGNATURES.pop(sender, None)
         return ["Reset done.\n" + _setup_prompt([k for k, _ in STEPS])]
     if n in TEXT_FIELDS:
         db.update_profile(DB_PATH, sender, notice=None, **{TEXT_FIELDS[n]: " ".join(a["value"].split())})
@@ -571,7 +593,9 @@ def _hint(sender: str, data: dict, text: str) -> str:
         out.append(f"Did you mean: {' '.join([guess[0]] + words[1:])}")
     notice = data.get("notice") or {}
     still = _open(sender, data.get("questions", {}))
-    if notice and text.strip() == str(NOTICE_ALIAS):
+    if data.get("sign_wait"):
+        out.append("I am waiting for a photo of your signature. Attach it, or reply SIGN TYPED.")
+    elif notice and text.strip() == str(NOTICE_ALIAS):
         out.append(f"To email your notice, type SEND {NOTICE_ALIAS}.")
     elif still:
         out.append(f"Open questions: {', '.join('Q' + k for k in still)}. Reply e.g. Q{next(iter(still))} no.")
@@ -597,6 +621,10 @@ def handle_text(sender: str, text: str) -> list[str]:
     if len(text) > 2000:  # never truncate: a cut paste can change a value (RATE 200 -> RATE 20)
         return ["That message is too long (2000 characters max). Please send it in parts."]
     text = _normalize(text)
+    if re.fullmatch(r"SIGN\s+TYPED", text.strip(), re.I):
+        db.update_profile(DB_PATH, sender, sign_typed=True, sign_wait=False)
+        SIGNATURES.pop(sender, None)
+        return [f"OK, your typed name will sign the notice. Reply SEND {NOTICE_ALIAS} to email it."]
     lines = [l for l in text.splitlines() if l.strip()]
     if len(lines) > 1 and lines[0].strip().upper() != "SCHEDULE":
         cmds = [parse(l) for l in lines]
@@ -628,15 +656,19 @@ def send_notice(sender: str, nid: int) -> list[str]:
     if pending.get("day") != _today().isoformat():
         return ["That preview is from an earlier day. Reply RECEIPT for a fresh one."]
     nid = pending["id"]  # SEND 1 = this worker's current notice
+    if sender not in SIGNATURES and not data.get("sign_typed"):
+        db.update_profile(DB_PATH, sender, sign_wait=True)
+        return [SIGN_ASK]
     if not db.claim_notice(DB_PATH, sender, nid):
         return ["That notice is not pending or the daily limit is reached."]
     now = datetime.now(LA)
-    note = "Schedules: " + "; ".join(
+    note = "Schedules:\n" + "\n".join(
         f"got {v.learned_at.astimezone(LA).date()} ({'worker-stated' if v.learned_source == 'worker' else 'upload date'})"
-        f", uploaded {v.received_at.astimezone(LA).date()}" for v in db.versions(DB_PATH, sender)) + "."
+        f", uploaded {v.received_at.astimezone(LA).date()}" for v in db.versions(DB_PATH, sender))
     step = "pdf"
     try:
-        pdf = notice.render_notice({**data, "schedule_note": note}, pending["lines"], now.date())
+        pdf = notice.render_notice({**data, "schedule_note": note}, pending["lines"], now.date(),
+                                   SIGNATURES.get(sender))
         step = "smtp"
         mid = notice.send(data["manager"], pdf, data["name"])
     except Exception as e:  # back to pending so the worker can retry; log the cause, never secrets or addresses
@@ -651,6 +683,8 @@ def send_notice(sender: str, nid: int) -> list[str]:
             f"notice {nid} not sent: step={step} error={type(e).__name__} code={code} missing_env={missing}")
         return [f"Not sent. Try SEND {NOTICE_ALIAS} again."]
     db.finish_notice(DB_PATH, sender, nid, mid)
+    SIGNATURES.pop(sender, None)  # used once, then gone
+    db.update_profile(DB_PATH, sender, sign_typed=False, sign_wait=False, notice=None)  # sent: SEND 1 is done
     return [f"Sent {_t(now.time())} to {data['manager']}. Your employer has 15 calendar days from receiving it to "
             f"fix this (until {_d(rules.cure_deadline(now))} if they receive it today). If not, you can file a "
             "complaint with OWS: wagesla.lacity.gov/complaint. Not legal advice."]
@@ -697,7 +731,8 @@ async def handle_item(ctx: Context, sender: str, item) -> None:
             await reply(ctx, sender, FALLBACK_TEXT)
             return
         ctx.logger.info(f"image downloaded: {len(data) // 1024} KB {_mime}")
-        await reply(ctx, sender, f"Got your schedule image ({max(1, round(len(data) / 1024))} KB). Reading it now.")
+        what = "signature photo" if await asyncio.to_thread(waiting_for_signature, sender) else "schedule image"
+        await reply(ctx, sender, f"Got your {what} ({max(1, round(len(data) / 1024))} KB). Reading it now.")
         for text in await asyncio.to_thread(handle_image, sender, data, _mime):
             await reply(ctx, sender, text)
     elif isinstance(item, TextContent):

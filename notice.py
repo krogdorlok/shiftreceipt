@@ -12,7 +12,10 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject, NumberObject, TextStringObject
+from PIL import Image, ImageChops, ImageFilter, ImageOps
+from pypdf import PageObject
+from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject, NameObject, NumberObject,
+                           TextStringObject)
 
 load_dotenv()
 TEMPLATE = Path(__file__).parent / "assets" / "notice_to_cure.pdf"
@@ -36,14 +39,66 @@ def _description(lines: list[dict], note: str) -> str:
     return "\n".join(out + ([note] if note else []))  # one item per line in a multiline field
 
 
-def render_notice(profile: dict, lines: list[dict], sent_date: date) -> bytes:
-    """lines: the may-be-owed ledger lines saved with the notice (rule, cents, citation, day, change)."""
+def clean_signature(photo: bytes) -> bytes:
+    """Photo of a handwritten signature -> PNG with only the ink, transparent background, cropped.
+    The paper's brightness (shadows included) is estimated with a wide blur; ink is what is darker than it.
+    Raises ValueError if the photo does not look like a signature."""
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(photo))).convert("L")
+    img.thumbnail((1600, 1600))
+    paper = img.filter(ImageFilter.GaussianBlur(max(img.size) // 30 or 1))
+    ink = ImageChops.subtract(paper, img)                      # 0 on paper, high on ink
+    alpha = ink.point(lambda v: 0 if v < 25 else 255 if v > 60 else (v - 25) * 255 // 35)
+    share = sum(alpha.histogram()[128:]) / (alpha.size[0] * alpha.size[1])
+    box = alpha.getbbox()
+    if not box or not 0.002 <= share <= 0.25 or (box[2] - box[0]) < 40:
+        raise ValueError("no signature found")
+    if box[3] - box[1] > box[2] - box[0]:  # signatures are wide; a tall block of ink is a page of text, not a signature
+        raise ValueError("does not look like a signature")
+    pad = 8
+    box = (max(box[0] - pad, 0), max(box[1] - pad, 0), min(box[2] + pad, img.size[0]), min(box[3] + pad, img.size[1]))
+    out = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]), (20, 30, 80, 0))  # dark blue ink
+    out.putalpha(alpha.crop(box))
+    buf = io.BytesIO()
+    out.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _stamp(writer: PdfWriter, page, rect, png: bytes) -> None:
+    """Draw the transparent signature PNG over a field rectangle (bottom aligned, may rise above the line)."""
+    img = Image.open(io.BytesIO(png)).convert("RGBA")
+    x1, y1, x2, y2 = (float(v) for v in rect)
+    h = min((y2 - y1) * 1.35, (x2 - x1 - 8) * img.height / img.width)  # stays below the line above
+    w = h * img.width / img.height
+
+    def stream(data: bytes, **keys) -> object:
+        s = DecodedStreamObject()
+        s.set_data(data)
+        s.update({NameObject(k): v for k, v in keys.items()})
+        return writer._add_object(s.flate_encode())
+
+    common = {"/Type": NameObject("/XObject"), "/Subtype": NameObject("/Image"), "/Width": NumberObject(img.width),
+              "/Height": NumberObject(img.height), "/BitsPerComponent": NumberObject(8)}
+    smask = stream(img.getchannel("A").tobytes(), **common, **{"/ColorSpace": NameObject("/DeviceGray")})
+    image = stream(img.convert("RGB").tobytes(), **common, **{"/ColorSpace": NameObject("/DeviceRGB"),
+                                                              "/SMask": smask})
+    overlay = PageObject.create_blank_page(width=page.mediabox.width, height=page.mediabox.height)
+    overlay[NameObject("/Resources")] = DictionaryObject({NameObject("/XObject"): DictionaryObject(
+        {NameObject("/Sig"): image})})
+    content = DecodedStreamObject()
+    content.set_data(f"q {w:.2f} 0 0 {h:.2f} {x1 + 4:.2f} {y1 + 1:.2f} cm /Sig Do Q".encode())
+    overlay[NameObject("/Contents")] = writer._add_object(content)
+    page.merge_page(overlay)
+
+
+def render_notice(profile: dict, lines: list[dict], sent_date: date, signature: bytes | None = None) -> bytes:
+    """lines: the may-be-owed ledger lines saved with the notice (rule, cents, citation, day, change).
+    signature: cleaned PNG from clean_signature, drawn in the signature box; None -> typed name."""
     name = profile["name"]
     text = {F_EMPLOYEE: name, F_EMPLOYER: profile["employer"], F_DATE: sent_date.isoformat(),
             F_TITLE: profile["title"], F_WHO: f"Store manager, {profile['manager']}",
             F_DESC: _description(lines, profile.get("schedule_note", "")),
             F_DATES: ", ".join(sorted({l["day"] for l in lines})), F_WHERE: profile["store"],
-            F_PRINT: name, F_SIGN: f"{name} (typed)"}
+            F_PRINT: name, F_SIGN: "" if signature else f"{name} (typed)"}
     boxes = {BOX_PAY: any(l["rule"] in PAY_RULES for l in lines), BOX_REST: any(l["rule"] == "R6" for l in lines)}
     reader = PdfReader(TEMPLATE)
     fields = reader.get_fields() or {}
@@ -65,6 +120,10 @@ def render_notice(profile: dict, lines: list[dict], sent_date: date) -> bytes:
                 a[NameObject("/DA")] = TextStringObject("/Helv 9 Tf 0 g")
     for page in w.pages:
         w.update_page_form_field_values(page, values, auto_regenerate=False)
+        if signature:
+            for a in page.get("/Annots") or []:
+                if a.get_object().get("/T") == F_SIGN:
+                    _stamp(w, page, a.get_object()["/Rect"], signature)
     w.set_need_appearances_writer(True)
     buf = io.BytesIO()
     w.write(buf)

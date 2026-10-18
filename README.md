@@ -24,7 +24,8 @@ on their phone.
 3. ShiftReceipt compares the versions, asks one yes/no question per change (did you ask for it?), and prints a
    receipt: every line has an amount that may be owed, the rule and the City citation.
 4. It shows a Notice to Cure preview on the official OWS form and tells the worker to check their paycheck first.
-   Only if the worker types `SEND <id>` is the notice emailed to the manager address they gave.
+   On `SEND 1` it asks the worker to sign: a photo of their handwritten signature has its background removed
+   and is placed on the form (or `SIGN TYPED` for a typed name). Only then is it emailed to the manager.
 
 ![Changed schedule screenshot](assets/demo/v2_changed_oct17.png)
 
@@ -98,6 +99,7 @@ cp .env.example .env             # fill AGENT_SEED, GEMINI_API_KEY, RESEND_API_K
 ## Privacy and safety
 
 - Images are never stored, only their sha256. Logs hold message ids, never message text or emails.
+- The signature photo is kept in memory only until that notice is sent, then dropped; never written to disk.
 - Every database query is filtered by sender. RESET works only for demo accounts.
 - Email goes only to the manager address the worker set, only after `SEND <id>`, at most 2 per day.
 

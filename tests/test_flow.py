@@ -243,6 +243,7 @@ def test_send_number_is_always_1(A, monkeypatch):
     for run in range(3):  # three demo runs, two users: always SEND 1
         for who in ("maria", "bob"):
             assert "reply SEND 1 to email" in golden(A, who)[-1]
+        say(A, "maria", "SIGN TYPED")
         assert say(A, "maria", "SEND 1").startswith("Sent")
         assert "not pending" in say(A, "maria", "SEND 1") and "not pending" in say(A, "maria", "SEND 2")
         assert "Reset done" in say(A, "maria", "RESET") and "Reset done" in say(A, "bob", "RESET")
