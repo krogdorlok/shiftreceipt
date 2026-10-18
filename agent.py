@@ -20,6 +20,7 @@ load_dotenv()
 DB_PATH = os.getenv("DB_PATH", "shiftreceipt.db")
 MAX_BYTES = 10 * 1024 * 1024
 TIMEOUT_S = 10
+MAX_REDIRECTS = 5
 
 SCHEDULE_EXAMPLE = "```\nSCHEDULE\n2026-10-20 09:00-17:00 Westwood\n2026-10-22 12:00-20:00 Westwood\n```"
 HELP_TEXT = ("ShiftReceipt checks your work schedule against the LA Fair Work Week Ordinance. Send a screenshot "
@@ -38,27 +39,51 @@ def download(url: str, transport: httpx.BaseTransport | None = None) -> tuple[by
         raise DownloadError("bad or non-http url")
     deadline = time.monotonic() + TIMEOUT_S
     try:
-        with httpx.Client(timeout=TIMEOUT_S, follow_redirects=True, transport=transport) as client:
-            with client.stream("GET", url) as r:
-                if r.status_code != 200:
-                    raise DownloadError(f"http {r.status_code}")
-                mime = r.headers.get("content-type", "").split(";")[0].strip().lower()
-                if not mime.startswith("image/"):
-                    raise DownloadError("not an image")
-                if int(r.headers.get("content-length") or 0) > MAX_BYTES:
-                    raise DownloadError("too large")
-                buf = bytearray()
-                for chunk in r.iter_bytes():
-                    buf += chunk
-                    if len(buf) > MAX_BYTES:
-                        raise DownloadError("too large")
-                    if time.monotonic() > deadline:  # read timeout is per chunk; cap the total too
-                        raise DownloadError("timeout")
-                return bytes(buf), mime
+        with httpx.Client(timeout=TIMEOUT_S, transport=transport) as client:
+            for _ in range(MAX_REDIRECTS + 1):  # follow redirects by hand so no redirect body is ever read
+                with client.stream("GET", url) as r:
+                    if not (r.is_redirect and r.next_request):
+                        return _read(r, deadline)
+                    _drain(r, deadline)
+                    url = str(r.next_request.url)
+                if not _http(url):
+                    raise DownloadError("bad redirect")
+            raise DownloadError("too many redirects")
     except httpx.TimeoutException:
         raise DownloadError("timeout") from None
     except (httpx.HTTPError, ValueError) as e:  # str(e) can contain the URL, so log only the type
         raise DownloadError(type(e).__name__) from None
+
+
+def _drain(r: httpx.Response, deadline: float) -> None:
+    """Redirect bodies are discarded, but still capped in size and time."""
+    n = 0
+    for chunk in r.iter_bytes():
+        n += len(chunk)
+        if n > MAX_BYTES:
+            raise DownloadError("too large")
+        if time.monotonic() > deadline:
+            raise DownloadError("timeout")
+
+
+def _read(r: httpx.Response, deadline: float) -> tuple[bytes, str]:
+    if r.status_code != 200:
+        raise DownloadError(f"http {r.status_code}")
+    mime = r.headers.get("content-type", "").split(";")[0].strip().lower()
+    if not mime.startswith("image/"):
+        raise DownloadError("not an image")
+    if int(r.headers.get("content-length") or 0) > MAX_BYTES:
+        raise DownloadError("too large")
+    buf = bytearray()
+    for chunk in r.iter_bytes():
+        buf += chunk
+        if len(buf) > MAX_BYTES:
+            raise DownloadError("too large")
+        if time.monotonic() > deadline:  # read timeout is per chunk; cap the total too
+            raise DownloadError("timeout")
+    if not buf:
+        raise DownloadError("empty")
+    return bytes(buf), mime
 
 
 def _http(u) -> bool:

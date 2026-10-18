@@ -105,3 +105,10 @@ def test_texts():
     for t in (HELP_TEXT, FALLBACK_TEXT):
         assert "—" not in t and "you are owed" not in t.lower()
     assert "Not legal advice" in HELP_TEXT and "may be owed" in HELP_TEXT
+
+
+def test_redirect_loop_and_bad_redirect():
+    with pytest.raises(DownloadError, match="too many"):
+        download("https://x.test/a", T(lambda r: httpx.Response(302, headers={"location": "/a"})))
+    with pytest.raises(DownloadError):
+        download("https://x.test/a", T(lambda r: httpx.Response(302, headers={"location": "ftp://x.test/a.png"})))
