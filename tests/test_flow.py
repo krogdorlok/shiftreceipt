@@ -118,6 +118,8 @@ def test_pasted_setup_lines_and_duplicate_schedule(A):
     assert "You are set up" in say(A, "u", "\n".join(SETUP))
     v1 = schedule_text(fixture("v1"))
     say(A, "u", v1)
+    assert "Here is what I read" in say(A, "u", v1)  # unconfirmed: shown again for review
+    say(A, "u", "CONFIRM")
     assert say(A, "u", v1) == "Already have this one."
 
 

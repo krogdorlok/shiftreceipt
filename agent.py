@@ -119,7 +119,9 @@ async def reply(ctx: Context, to: str, text: str) -> None:
 
 # ---- M3 worker flow. Sync on purpose: the handler runs it in asyncio.to_thread (db, Gemini). ----
 DEMO_SENDERS = {s.strip() for s in os.getenv("DEMO_SENDERS", "").split(",") if s.strip()}
-PENDING_IMAGES: dict[str, tuple[bytes, str, str]] = {}  # ponytail: memory only (images never stored); lost on restart
+# Images that arrive before NAME (needed to pick the worker's row) wait here, in memory only: images are never
+# stored. Once NAME is known they are read at once and saved as versions, so later steps survive a restart.
+PENDING_IMAGES: dict[str, list[tuple[bytes, str, str]]] = defaultdict(list)
 LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # one message at a time per sender
 
 COVER_TEXT = ("Three yes/no questions: (1) Is your employer a retail business? (2) Does it have 300+ employees "
@@ -276,9 +278,21 @@ def receipt(sender: str) -> list[str]:
     return ["\n".join(out)]
 
 
-def _new_version(sender: str, sha: str, shifts: list[Shift], warnings: list[str]) -> list[str]:
-    if any(v.sha256 == sha for v in db.versions(DB_PATH, sender, confirmed_only=False)):
+def _known(sender: str, sha: str) -> list[str] | None:
+    """Reply for a schedule seen before: confirmed -> duplicate; unconfirmed -> bring it back up for review."""
+    v = next((v for v in db.versions(DB_PATH, sender, confirmed_only=False) if v.sha256 == sha), None)
+    if not v:
+        return None
+    if any(c.id == v.id for c in db.versions(DB_PATH, sender)):
         return ["Already have this one."]
+    db.update_profile(DB_PATH, sender, pending_vid=v.id)
+    data, _ = db.get_profile(DB_PATH, sender)
+    return [_show(v)] if not _missing(data) else ["Already saved; I will show it once you are set up."]
+
+
+def _new_version(sender: str, sha: str, shifts: list[Shift], warnings: list[str]) -> list[str]:
+    if (known := _known(sender, sha)) is not None:
+        return known
     vid, _ = db.add_version(DB_PATH, sender, sha, shifts)
     db.update_profile(DB_PATH, sender, pending_vid=vid)
     data, _ = db.get_profile(DB_PATH, sender)
@@ -289,12 +303,14 @@ def _new_version(sender: str, sha: str, shifts: list[Shift], warnings: list[str]
 
 def handle_image(sender: str, data: bytes, mime: str) -> list[str]:
     sha = hashlib.sha256(data).hexdigest()
-    if any(v.sha256 == sha for v in db.versions(DB_PATH, sender, confirmed_only=False)):
+    if (known := _known(sender, sha)) is not None:
+        return known
+    if any(q[2] == sha for q in PENDING_IMAGES[sender]):
         return ["Already have this one."]
     profile, _ = db.get_profile(DB_PATH, sender)
-    if m := _missing(profile):
-        PENDING_IMAGES[sender] = (data, mime, sha)
-        return ["I will read it once you are set up.\n" + _setup_prompt(m)]
+    if not profile.get("name"):
+        PENDING_IMAGES[sender].append((data, mime, sha))
+        return ["I will read it once you are set up.\n" + _setup_prompt(_missing(profile))]
     shifts, warnings = extract(data, mime, profile["name"], _today())
     if not shifts:
         return [f"I could not read any shifts for {profile['name']} in that image. You can type your schedule "
@@ -304,13 +320,16 @@ def handle_image(sender: str, data: bytes, mime: str) -> list[str]:
 
 def _after_setup_field(sender: str, state: str) -> list[str]:
     data, _ = db.get_profile(DB_PATH, sender)
+    read = []
+    if data.get("name"):  # NAME known: read the waiting images now and save them as versions
+        for img in PENDING_IMAGES.pop(sender, []):
+            read += handle_image(sender, img[0], img[1])
+        data, _ = db.get_profile(DB_PATH, sender)
     if m := _missing(data):
         return ["Saved.\n" + _setup_prompt(m)]
     if state != "onboarding":
-        return ["Saved."]
+        return ["Saved."] + read
     db.update_profile(DB_PATH, sender, state="ready")
-    if img := PENDING_IMAGES.pop(sender, None):
-        return ["You are set up. Reading your schedule image now."] + handle_image(sender, img[0], img[1])
     if v := _pending(sender, data):
         return ["You are set up.\n\n" + _show(v)]
     return ["You are set up. Send a screenshot of your schedule, or type it like this:\n\n" + SCHEDULE_EXAMPLE]
@@ -348,7 +367,11 @@ def run(sender: str, c) -> list[str]:
         if n == "CONFIRM":
             db.update_version(DB_PATH, sender, v.id, confirmed=True)
             db.update_profile(DB_PATH, sender, pending_vid=None)
-            return ["Confirmed."] + _after_confirm(sender)
+            done = {c.id for c in db.versions(DB_PATH, sender)}
+            left = [u.id for u in db.versions(DB_PATH, sender, confirmed_only=False) if u.id not in done]
+            note = (f" Schedule(s) {', '.join(map(str, left))} are still unconfirmed: send them again to review."
+                    if left else "")
+            return ["Confirmed." + note] + _after_confirm(sender)
         if n == "GOT":
             if a["day"] > _today():
                 return ["That date is in the future. Reply GOT with the date you got this schedule."]
@@ -385,8 +408,17 @@ def run(sender: str, c) -> list[str]:
     return [HELP_TEXT]
 
 
+def welcome(sender: str) -> str:
+    data, _ = db.get_profile(DB_PATH, sender)
+    if m := _missing(data):
+        return ("Hi, I am ShiftReceipt. I check LA Fair Work Week schedule changes and show what may be owed. "
+                "Not legal advice.\n" + _setup_prompt(m))
+    return "Welcome back. Send your newest schedule, or RECEIPT to see your receipt."
+
+
 def handle_text(sender: str, text: str) -> list[str]:
     """One command per message, or one per line when every line is a command (pasted onboarding)."""
+    text = (text or "")[:2000]  # same cap as parser.parse, for the whole paste
     lines = [l for l in (text or "").splitlines() if l.strip()]
     if len(lines) > 1 and lines[0].strip().upper() != "SCHEDULE" and all(cmds := [parse(l) for l in lines]):
         out = []
@@ -428,6 +460,7 @@ async def handle_item(ctx: Context, sender: str, item) -> None:
         await ctx.send(sender, ChatMessage(timestamp=_now(), msg_id=uuid4(),
                                            content=[MetadataContent(type="metadata",
                                                                     metadata={"attachments": "true"})]))
+        await reply(ctx, sender, await asyncio.to_thread(welcome, sender))
     elif isinstance(item, ResourceContent):
         url = image_url(item)
         try:
