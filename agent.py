@@ -635,6 +635,8 @@ async def handle_item(ctx: Context, sender: str, item) -> None:
         await reply(ctx, sender, await asyncio.to_thread(welcome, sender))
     elif isinstance(item, ResourceContent):
         url = image_url(item)
+        res = item.resource if isinstance(item.resource, list) else [item.resource]
+        ctx.logger.info(f"image: {len(res)} resource(s), mime hints {[r.metadata.get('mime_type') for r in res]}")
         try:
             if not url:
                 raise DownloadError("no url")
@@ -643,6 +645,7 @@ async def handle_item(ctx: Context, sender: str, item) -> None:
             ctx.logger.info(f"image download failed: {e}")
             await reply(ctx, sender, FALLBACK_TEXT)
             return
+        ctx.logger.info(f"image downloaded: {len(data) // 1024} KB {_mime}")
         await reply(ctx, sender, f"Got your schedule image ({max(1, round(len(data) / 1024))} KB). Reading it now.")
         for text in await asyncio.to_thread(handle_image, sender, data, _mime):
             await reply(ctx, sender, text)

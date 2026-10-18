@@ -1,5 +1,6 @@
 """Read one worker's shifts from a schedule screenshot. Gemini only extracts; Python validates and sets the year."""
 import base64
+import logging
 import mimetypes
 import os
 import re
@@ -104,6 +105,9 @@ def _post(rows: list[Row], ref_date: date) -> tuple[list[Shift], list[str]]:
     return sorted(shifts, key=lambda x: x.start_dt()), warnings
 
 
+LOG = logging.getLogger("shiftreceipt")
+
+
 def extract(image_bytes: bytes, mime: str, worker_name: str, ref_date: date) -> tuple[list[Shift], list[str]]:
     prompt = PROMPT.format(name=" ".join(worker_name.split())[:80])
     try:
@@ -112,11 +116,16 @@ def extract(image_bytes: bytes, mime: str, worker_name: str, ref_date: date) -> 
                 text = _gemini(image_bytes, mime, prompt)
                 break
             except Exception as e:
+                LOG.warning(f"extract: gemini attempt {attempt + 1} failed: {type(e).__name__}")
                 if attempt or not _retryable(e):
                     return [], ["unreadable"]
         rows = Extraction.model_validate_json(text or "").shifts
-        return _post(rows, ref_date) if rows else ([], ["unreadable"])  # not a schedule
-    except Exception:  # bad JSON, auth, quota, anything: the worker gets the typed fallback
+        shifts, warnings = _post(rows, ref_date) if rows else ([], ["unreadable"])  # no rows: not a schedule
+        LOG.warning(f"extract: {len(image_bytes) // 1024} KB {mime}: {len(rows)} rows from gemini, "
+                    f"{len(shifts)} kept, {len(warnings)} dropped")  # counts only, never content
+        return shifts, warnings
+    except Exception as e:  # bad JSON, auth, quota, anything: the worker gets the typed fallback
+        LOG.warning(f"extract: failed: {type(e).__name__}")
         return [], ["unreadable"]
 
 
