@@ -82,9 +82,17 @@ def send(to: str, pdf_bytes: bytes, worker_name: str) -> str:
         "of this notice to cure the alleged violations described in the attached Statement of Facts.\n\n"
         "This notice was prepared with ShiftReceipt.")
     msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename="Notice_to_Cure.pdf")
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
-        s.login(user, password)
-        s.send_message(msg)
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
+            s.login(user, password)
+            s.send_message(msg)
+    except OSError as e:  # some networks block 465 but allow 587 (auth errors are not OSError: no retry)
+        if isinstance(e, smtplib.SMTPException):
+            raise
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as s:
+            s.starttls()
+            s.login(user, password)
+            s.send_message(msg)
     return msg["Message-ID"]
 
 

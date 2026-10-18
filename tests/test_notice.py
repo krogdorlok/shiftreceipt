@@ -97,3 +97,27 @@ def test_other_sender_cannot_send(A, smtp):
     golden(A, "bob", upto=7)
     assert "not pending" in say(A, "bob", f"SEND {nid}") and smtp.sent == []
     assert "not pending" in say(A, "maria", "SEND 999") and smtp.sent == []
+
+
+def test_send_falls_back_to_587_when_465_blocked(monkeypatch, smtp):
+    def blocked(*a, **k):
+        raise TimeoutError()
+    used = []
+
+    class Plain(FakeSMTP):
+        def __init__(self, host, port, timeout):
+            used.append(port)
+
+        def starttls(self):
+            pass
+
+    monkeypatch.setattr(notice.smtplib, "SMTP_SSL", blocked)
+    monkeypatch.setattr(notice.smtplib, "SMTP", Plain)
+    assert notice.send("boss@example.com", b"%PDF", "Maria Lopez") and used == [587] and len(smtp.sent) == 1
+
+
+def test_send_auth_error_is_not_retried_on_587(monkeypatch, smtp):
+    smtp.fail = True
+    monkeypatch.setattr(notice.smtplib, "SMTP", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no retry")))
+    with pytest.raises(smtplib.SMTPAuthenticationError):
+        notice.send("boss@example.com", b"%PDF", "Maria Lopez")
