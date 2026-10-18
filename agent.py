@@ -1,8 +1,10 @@
-"""ShiftReceipt agent: ASI:One Chat Protocol front end. M1 skeleton: ack, dedupe, image download, parse."""
+"""ShiftReceipt agent: ASI:One Chat Protocol front end and the worker flow (state per sender in SQLite)."""
 import asyncio
+import hashlib
 import os
-import time
-from datetime import datetime, timezone
+import time as clock
+from collections import defaultdict
+from datetime import date, datetime, time, timezone
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -14,6 +16,10 @@ from uagents_core.contrib.protocols.chat import (ChatAcknowledgement, ChatMessag
                                                  chat_protocol_spec)
 
 import db
+import rules
+from diff import diff
+from extract import extract, schedule_text
+from models import LA, Answers, Coverage, Shift
 from parser import parse
 
 load_dotenv()
@@ -37,7 +43,7 @@ class DownloadError(Exception):
 def download(url: str, transport: httpx.BaseTransport | None = None) -> tuple[bytes, str]:
     if not _http(url):
         raise DownloadError("bad or non-http url")
-    deadline = time.monotonic() + TIMEOUT_S
+    deadline = clock.monotonic() + TIMEOUT_S
     try:
         with httpx.Client(timeout=TIMEOUT_S, transport=transport) as client:
             for _ in range(MAX_REDIRECTS + 1):  # follow redirects by hand so no redirect body is ever read
@@ -62,7 +68,7 @@ def _drain(r: httpx.Response, deadline: float) -> None:
         n += len(chunk)
         if n > MAX_BYTES:
             raise DownloadError("too large")
-        if time.monotonic() > deadline:
+        if clock.monotonic() > deadline:
             raise DownloadError("timeout")
 
 
@@ -79,7 +85,7 @@ def _read(r: httpx.Response, deadline: float) -> tuple[bytes, str]:
         buf += chunk
         if len(buf) > MAX_BYTES:
             raise DownloadError("too large")
-        if time.monotonic() > deadline:  # read timeout is per chunk; cap the total too
+        if clock.monotonic() > deadline:  # read timeout is per chunk; cap the total too
             raise DownloadError("timeout")
     if not buf:
         raise DownloadError("empty")
@@ -111,6 +117,294 @@ async def reply(ctx: Context, to: str, text: str) -> None:
     await ctx.send(to, ChatMessage(timestamp=_now(), msg_id=uuid4(), content=[TextContent(type="text", text=text)]))
 
 
+# ---- M3 worker flow. Sync on purpose: the handler runs it in asyncio.to_thread (db, Gemini). ----
+DEMO_SENDERS = {s.strip() for s in os.getenv("DEMO_SENDERS", "").split(",") if s.strip()}
+PENDING_IMAGES: dict[str, tuple[bytes, str, str]] = {}  # ponytail: memory only (images never stored); lost on restart
+LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # one message at a time per sender
+
+COVER_TEXT = ("Three yes/no questions: (1) Is your employer a retail business? (2) Does it have 300+ employees "
+              "worldwide? (3) Is your store inside the City of Los Angeles (not Santa Monica, Culver City, Burbank, "
+              "Glendale, Beverly Hills, Pasadena) and do you work 2+ hours a week there? Reply e.g. COVER yes yes yes")
+STEPS = [("name", "NAME your full name, e.g. NAME Maria Lopez"),
+         ("rate", "RATE your hourly pay, e.g. RATE 20"),
+         ("employer", "EMPLOYER the company you work for"),
+         ("title", "TITLE your job title, e.g. TITLE Cashier"),
+         ("store", "STORE your store and city, e.g. STORE Westwood, Los Angeles"),
+         ("manager", "MANAGER the email of the person who sets your schedule"),
+         ("cover", COVER_TEXT)]
+TEXT_FIELDS = {"NAME": "name", "EMPLOYER": "employer", "TITLE": "title", "STORE": "store"}
+FOOTER = ("When did you get this schedule? If not today reply GOT YYYY-MM-DD. Fix with EDIT YYYY-MM-DD HH:MM-HH:MM "
+          "or DROP YYYY-MM-DD. Then CONFIRM.")
+QUESTIONS = {"employee_requested": "Did you ask for this change?",
+             "voluntary_cover": "Did you volunteer to cover for a coworker?",
+             "misconduct": "Was this cut for a disciplinary reason?"}
+KIND_WORDS = {"added": "shift added", "cancelled": "shift cancelled", "hours_added": "hours added",
+              "hours_cut": "hours cut", "moved": "shift moved", "moved_and_added": "shift moved and hours added",
+              "moved_and_cut": "shift moved and hours cut", "needs_review": "change needs review"}
+PAY_RULES = {"R2", "R3", "R4"}
+
+
+def _today() -> date:
+    return datetime.now(LA).date()
+
+
+def _t(t: time) -> str:
+    return f"{t.hour % 12 or 12}:{t.minute:02d} {'AM' if t.hour < 12 else 'PM'}"
+
+
+def _d(d: date) -> str:
+    return f"{d:%a %b} {d.day}"
+
+
+def _shift(s: Shift) -> str:
+    return f"{_d(s.day)} {_t(s.start)}-{_t(s.end)}" + (f" {s.location}" if s.location else "")
+
+
+def usd(cents: int) -> str:
+    return f"${cents // 100:,}.{cents % 100:02d}"
+
+
+def _missing(data: dict) -> list[str]:
+    return [k for k, _ in STEPS if not data.get(k)]
+
+
+def _setup_prompt(missing: list[str]) -> str:
+    return "To set up, reply with:\n" + "\n".join(f"- {text}" for k, text in STEPS if k in missing)
+
+
+def _sha_shifts(shifts: list[Shift]) -> str:
+    return hashlib.sha256(schedule_text(sorted(shifts, key=lambda s: s.start_dt())).encode()).hexdigest()
+
+
+def _pending(sender: str, data: dict):
+    return next((v for v in db.versions(DB_PATH, sender, confirmed_only=False) if v.id == data.get("pending_vid")),
+                None)
+
+
+def _show(v, warnings: list[str] = ()) -> str:
+    rows = [f"{i}. {_shift(s)}" for i, s in enumerate(sorted(v.shifts, key=lambda s: s.start_dt()), 1)]
+    out = [f"Here is what I read (schedule {v.id}, got on {_d(v.learned_at.astimezone(LA).date())}):"]
+    out += rows or ["(no shifts)"]
+    out += [f"Skipped: {w}" for w in warnings if w != "unreadable"]
+    return "\n".join(out + ["", FOOTER])
+
+
+def _describe(e) -> str:
+    what = KIND_WORDS[e.kind]
+    if e.old and e.new:
+        return f"{what} from {_shift(e.old)} to {_shift(e.new)}"
+    return f"{what} ({_shift(e.old or e.new)})" if (e.old or e.new) else what
+
+
+def _events(sender: str):
+    vs = db.versions(DB_PATH, sender)
+    return vs, [e for a, b in zip(vs, vs[1:]) for e in diff(a, b)]
+
+
+def _ask(events, qs: dict) -> str:
+    by_id = {e.id: e for e in events}
+    out = ["A few questions about each change. Reply to each, e.g. Q1 no."]
+    for n, (eid, field) in qs.items():
+        e = by_id.get(eid)
+        out.append(f"Q{n} {_d(e.day)}, {_describe(e)}: {QUESTIONS[field]}" if e else f"Q{n} {QUESTIONS[field]}")
+    return "\n".join(out)
+
+
+def _open(sender: str, qs: dict) -> dict:
+    answers = db.get_answers(DB_PATH, sender)
+    return {n: q for n, q in qs.items() if getattr(answers.get(q[0], Answers()), q[1]) is None}
+
+
+def _after_confirm(sender: str) -> list[str]:
+    data, _ = db.get_profile(DB_PATH, sender)
+    vs, events = _events(sender)
+    missing = rules.missing_answers(events, db.get_answers(DB_PATH, sender))
+    if not missing or not Coverage(**data["cover"]).covered():
+        return receipt(sender)
+    qs = {str(i): list(m) for i, m in enumerate(missing, 1)}
+    db.update_profile(DB_PATH, sender, questions=qs)
+    return [_ask(events, qs)]
+
+
+def receipt(sender: str) -> list[str]:
+    data, _ = db.get_profile(DB_PATH, sender)
+    vs, events = _events(sender)
+    if not vs:
+        return ["No confirmed schedule yet. Send your schedule, then CONFIRM."]
+    cov = Coverage(**data["cover"])
+    ot = {date.fromisoformat(k): v for k, v in data.get("ot", {}).items()}
+    lines = (rules.evaluate(events, db.get_answers(DB_PATH, sender), cov, data["rate"])
+             + rules.rest_lines(vs[-1].shifts, cov, data["rate"], ot))
+    by_id = {e.id: e for e in events}
+    out, saved = ["Your schedule receipt:"], []
+    if len(vs) == 1:
+        out.append("This is your first schedule, so I saved it as a baseline. Only the rest rule applies until a "
+                   "changed schedule arrives.")
+    for l in lines:
+        e = by_id.get(l.event_id)
+        day = e.day if e else date.fromisoformat(l.event_id.removeprefix("rest-"))
+        what = KIND_WORDS[e.kind] if e else "under 10 hours rest"
+        status = ("may be owed" + (" if you work it" if l.rule == "R6" and day >= _today() else "")
+                  if l.status == "may_be_owed" else f"{l.status.replace('_', ' ')}: {l.explanation}")
+        out.append(f"{_d(day)} | {what} | {usd(l.cents)} | {status} | {l.citation}")
+        saved.append({**l.model_dump(), "day": day.isoformat(), "change": what})
+    if not lines:
+        out.append("No changes found between your schedules.")
+    sched, rest, tot = rules.total(lines, PAY_RULES), rules.total(lines, {"R6"}), rules.total(lines)
+    out += [f"Schedule change pay that may be owed: {usd(sched)}"]
+    if rest:
+        out += [f"Rest premium that may be owed, only for shifts you actually work: {usd(rest)}"]
+    out += [f"Estimated total: {usd(tot)}. This is an estimate, not unpaid wages yet: predictability pay is due on "
+            "the payday for the pay period of the change.", rules.NOT_CHECKED, "Questions: OWS (844) 924-3752"]
+    due = rules.due_lines(lines, _today())
+    if due:
+        # ponytail: a new pending notice per receipt; claim_notice's daily cap limits what can actually be sent
+        keep = {l.event_id for l in due}
+        nid = db.create_notice(DB_PATH, sender, [s for s in saved if s["event_id"] in keep], rules.total(due))
+        out += ["", f"Notice preview ({nid}): {data['employer']} may owe {data['name']} {usd(rules.total(due))} "
+                    "under the LA Fair Work Week Ordinance for:"]
+        out += [f"- {s['day']} {s['change']}: {usd(s['cents'])}" for s in saved if s["event_id"] in keep]
+        out += ["Check your paycheck for that pay period first. If the pay is missing, reply SEND "
+                f"{nid} to email the official Notice to Cure to {data['manager']}. Your employer then has 15 days "
+                "from receiving it to fix this."]
+    elif tot:
+        out += ["", "Nothing to claim yet: the rest premium is only owed once you work that shift. Reply RECEIPT "
+                    "after you work it."]
+    else:
+        out += ["", "Nothing may be owed right now (the reason is on each line). Your saved schedules protect you "
+                    "later: send every new schedule you get and I compare it with these."]
+    return ["\n".join(out)]
+
+
+def _new_version(sender: str, sha: str, shifts: list[Shift], warnings: list[str]) -> list[str]:
+    if any(v.sha256 == sha for v in db.versions(DB_PATH, sender, confirmed_only=False)):
+        return ["Already have this one."]
+    vid, _ = db.add_version(DB_PATH, sender, sha, shifts)
+    db.update_profile(DB_PATH, sender, pending_vid=vid)
+    data, _ = db.get_profile(DB_PATH, sender)
+    if m := _missing(data):
+        return ["Saved your schedule. I will show it once you are set up.\n" + _setup_prompt(m)]
+    return [_show(_pending(sender, data), warnings)]
+
+
+def handle_image(sender: str, data: bytes, mime: str) -> list[str]:
+    sha = hashlib.sha256(data).hexdigest()
+    if any(v.sha256 == sha for v in db.versions(DB_PATH, sender, confirmed_only=False)):
+        return ["Already have this one."]
+    profile, _ = db.get_profile(DB_PATH, sender)
+    if m := _missing(profile):
+        PENDING_IMAGES[sender] = (data, mime, sha)
+        return ["I will read it once you are set up.\n" + _setup_prompt(m)]
+    shifts, warnings = extract(data, mime, profile["name"], _today())
+    if not shifts:
+        return [f"I could not read any shifts for {profile['name']} in that image. You can type your schedule "
+                "instead:\n\n" + SCHEDULE_EXAMPLE]
+    return _new_version(sender, sha, shifts, warnings)
+
+
+def _after_setup_field(sender: str, state: str) -> list[str]:
+    data, _ = db.get_profile(DB_PATH, sender)
+    if m := _missing(data):
+        return ["Saved.\n" + _setup_prompt(m)]
+    if state != "onboarding":
+        return ["Saved."]
+    db.update_profile(DB_PATH, sender, state="ready")
+    if img := PENDING_IMAGES.pop(sender, None):
+        return ["You are set up. Reading your schedule image now."] + handle_image(sender, img[0], img[1])
+    if v := _pending(sender, data):
+        return ["You are set up.\n\n" + _show(v)]
+    return ["You are set up. Send a screenshot of your schedule, or type it like this:\n\n" + SCHEDULE_EXAMPLE]
+
+
+def run(sender: str, c) -> list[str]:
+    data, state = db.get_profile(DB_PATH, sender)
+    n, a = c.name, c.args
+    if n == "HELP":
+        return [HELP_TEXT]
+    if n == "RESET":
+        if sender not in DEMO_SENDERS:
+            return ["RESET is only available on demo accounts."]
+        db.reset(DB_PATH, sender)
+        PENDING_IMAGES.pop(sender, None)
+        return ["Reset done.\n" + _setup_prompt([k for k, _ in STEPS])]
+    if n in TEXT_FIELDS:
+        db.update_profile(DB_PATH, sender, **{TEXT_FIELDS[n]: " ".join(a["value"].split())})
+        return _after_setup_field(sender, state)
+    if n in ("RATE", "MANAGER", "COVER"):
+        db.update_profile(DB_PATH, sender, **{"RATE": {"rate": a.get("cents")}, "MANAGER": {"manager": a.get("email")},
+                                              "COVER": {"cover": a}}[n])
+        return _after_setup_field(sender, state)
+    if n == "SCHEDULE":
+        shifts = [Shift(**s) for s in a["shifts"]]
+        if any(s.minutes() > 16 * 60 for s in shifts):
+            return ["A shift longer than 16 hours looks like a typo. Please check and send it again."]
+        return _new_version(sender, _sha_shifts(shifts), shifts, [])
+    if m := _missing(data):
+        return [_setup_prompt(m)]
+    if n in ("GOT", "EDIT", "DROP", "CONFIRM"):
+        v = _pending(sender, data)
+        if not v:
+            return ["Nothing waiting to confirm. Send a schedule first."]
+        if n == "CONFIRM":
+            db.update_version(DB_PATH, sender, v.id, confirmed=True)
+            db.update_profile(DB_PATH, sender, pending_vid=None)
+            return ["Confirmed."] + _after_confirm(sender)
+        if n == "GOT":
+            if a["day"] > _today():
+                return ["That date is in the future. Reply GOT with the date you got this schedule."]
+            db.update_version(DB_PATH, sender, v.id, learned_at=datetime.combine(a["day"], time(9), LA))
+        else:
+            keep = [s for s in v.shifts if s.day != a["day"]]
+            if n == "DROP" and len(keep) == len(v.shifts):
+                return [f"No shift on {_d(a['day'])}."]
+            if n == "EDIT":
+                old = next((s for s in v.shifts if s.day == a["day"]), None)
+                new = Shift(day=a["day"], start=a["start"], end=a["end"], location=old.location if old else None)
+                if new.minutes() > 16 * 60:
+                    return ["A shift longer than 16 hours looks like a typo. Please check and try again."]
+                keep.append(new)
+            db.update_version(DB_PATH, sender, v.id, shifts=sorted(keep, key=lambda s: s.start_dt()))
+        return [_show(_pending(sender, data))]
+    if n == "ANSWER":
+        qs = data.get("questions", {})
+        if str(a["q"]) not in qs:
+            vs, events = _events(sender)
+            still = _open(sender, qs)
+            return [_ask(events, still) if still else "No open questions. Reply RECEIPT to see your receipt."]
+        eid, field = qs[str(a["q"])]
+        db.set_answer(DB_PATH, sender, eid, field, a["value"])
+        still = _open(sender, qs)
+        return [f"Saved. Still open: {', '.join('Q' + k for k in still)}."] if still else receipt(sender)
+    if n == "RECEIPT":
+        return receipt(sender)
+    if n == "OT":
+        db.update_profile(DB_PATH, sender, ot={**data.get("ot", {}), a["day"].isoformat(): a["minutes"]})
+        return [f"Saved {a['minutes']} overtime minutes on {_d(a['day'])}."]
+    if n == "SEND":
+        return send_notice(sender, a["id"])
+    return [HELP_TEXT]
+
+
+def handle_text(sender: str, text: str) -> list[str]:
+    """One command per message, or one per line when every line is a command (pasted onboarding)."""
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    if len(lines) > 1 and lines[0].strip().upper() != "SCHEDULE" and all(cmds := [parse(l) for l in lines]):
+        out = []
+        for c in cmds:
+            out = run(sender, c)
+        return out
+    c = parse(text)
+    if not c:
+        data, _ = db.get_profile(DB_PATH, sender)
+        m = _missing(data)
+        return [HELP_TEXT + ("\n\n" + _setup_prompt(m) if m else "")]
+    return run(sender, c)
+
+
+def send_notice(sender: str, nid: int) -> list[str]:
+    return ["Sending notices arrives in the next update."]  # M4
+
+
 chat = Protocol(spec=chat_protocol_spec)
 
 
@@ -120,12 +414,13 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
     if not await asyncio.to_thread(db.first_time, DB_PATH, f"{sender}:{msg.msg_id}"):
         return
     ctx.logger.info(f"msg {msg.msg_id} from {sender[:16]} items={len(msg.content)}")
-    for item in msg.content:
-        try:
-            await handle_item(ctx, sender, item)
-        except Exception as e:  # never crash the handler on one bad item
-            ctx.logger.error(f"msg {msg.msg_id} failed: {type(e).__name__}")
-            await reply(ctx, sender, "Something went wrong on my side. Please try again.")
+    async with LOCKS[sender]:
+        for item in msg.content:
+            try:
+                await handle_item(ctx, sender, item)
+            except Exception as e:  # never crash the handler on one bad item
+                ctx.logger.error(f"msg {msg.msg_id} failed: {type(e).__name__}")
+                await reply(ctx, sender, "Something went wrong on my side. Please try again.")
 
 
 async def handle_item(ctx: Context, sender: str, item) -> None:
@@ -143,10 +438,12 @@ async def handle_item(ctx: Context, sender: str, item) -> None:
             ctx.logger.info(f"image download failed: {e}")
             await reply(ctx, sender, FALLBACK_TEXT)
             return
-        await reply(ctx, sender, f"Got your schedule image ({max(1, round(len(data) / 1024))} KB)")
+        await reply(ctx, sender, f"Got your schedule image ({max(1, round(len(data) / 1024))} KB). Reading it now.")
+        for text in await asyncio.to_thread(handle_image, sender, data, _mime):
+            await reply(ctx, sender, text)
     elif isinstance(item, TextContent):
-        c = parse(item.text)
-        await reply(ctx, sender, f"Understood: {c.name}" if c and c.name != "HELP" else HELP_TEXT)
+        for text in await asyncio.to_thread(handle_text, sender, item.text):
+            await reply(ctx, sender, text)
 
 
 @chat.on_message(ChatAcknowledgement)
