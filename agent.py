@@ -3,6 +3,7 @@ import asyncio
 import difflib
 import hashlib
 import json
+import logging
 import os
 import re
 import time as clock
@@ -586,11 +587,17 @@ def send_notice(sender: str, nid: int) -> list[str]:
     note = "Schedules: " + "; ".join(
         f"got {v.learned_at.astimezone(LA).date()} ({'worker-stated' if v.learned_source == 'worker' else 'upload date'})"
         f", uploaded {v.received_at.astimezone(LA).date()}" for v in db.versions(DB_PATH, sender)) + "."
+    step = "pdf"
     try:
         pdf = notice.render_notice({**data, "schedule_note": note}, pending["lines"], now.date())
+        step = "smtp"
         mid = notice.send(data["manager"], pdf, data["name"])
-    except Exception:  # SMTP, auth, PDF: back to pending so the worker can retry; never echo the error
+    except Exception as e:  # back to pending so the worker can retry; log the cause, never secrets or addresses
         db.finish_notice(DB_PATH, sender, nid, None)
+        code = getattr(e, "smtp_code", "")
+        missing = [k for k in ("SMTP_USER", "SMTP_APP_PASSWORD") if not os.getenv(k)]
+        logging.getLogger("shiftreceipt").error(
+            f"notice {nid} not sent: step={step} error={type(e).__name__} smtp_code={code} missing_env={missing}")
         return [f"Not sent. Try SEND {nid} again."]
     db.finish_notice(DB_PATH, sender, nid, mid)
     return [f"Sent {_t(now.time())} to {data['manager']}. Your employer has 15 calendar days from receiving it to "
