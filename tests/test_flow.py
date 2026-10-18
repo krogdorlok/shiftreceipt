@@ -168,7 +168,7 @@ def test_next_week_is_not_a_change_and_edited_reupload_is_new(A):
 
 def test_prose_send_is_not_a_send(A):
     assert "type SEND 7" in say(A, "u", "Please send receipt 7")
-    assert "ShiftReceipt checks" in say(A, "u", "Do not send receipt 7")  # negated: not a command at all
+    assert "could not read" in say(A, "u", "Do not send receipt 7")  # negated: not a command at all
 
 
 def test_stale_preview_needs_fresh_receipt(A):
@@ -199,3 +199,27 @@ def test_cards_kill_switch(A, monkeypatch):
         ctx = Ctx()
         asyncio.run(A.on_chat(ctx, "maria", ChatMessage(content=[TextContent(text=f"Q{q} no")], msg_id=uuid4())))
     assert all(isinstance(m.content[0], TextContent) for _, m in ctx.out if isinstance(m, ChatMessage))
+
+
+AT = "@agent1qffxdzuxgw6ad4k6dmlsfxd4h7ey26mgsfs0nt6lkgz8wv97z4w7wfexzpq "
+
+
+def test_asi_one_mention_and_one_line_setup(A):
+    r = say(A, "u", AT + "NAME Maria Lopez RATE 20 EMPLOYER Case TITLE Secretary STORE La Cienega, Los Angeles "
+                         "MANAGER boss@example.com COVER yes yes yes")
+    assert "You are set up" in r
+    data, _ = db.get_profile(A.DB_PATH, "u")
+    assert (data["name"], data["rate"], data["employer"], data["store"]) == ("Maria Lopez", 2000, "Case",
+                                                                           "La Cienega, Los Angeles")
+    r = say(A, "u", AT + "SCHEDULE 2026-10-20 09:00-17:00 Westwood 2026-10-22 12:00-18:00 Westwood")
+    assert "1. Tue Oct 20 9:00 AM-5:00 PM Westwood" in r and "2. Thu Oct 22" in r
+    assert "baseline" in say(A, "u", AT + "GOT 2026-10-03 CONFIRM")
+
+
+def test_missing_keywords_get_a_copyable_block(A):
+    # what was actually sent from ASI:One: keywords missing for employer, manager and cover
+    r = say(A, "u", AT + "NAME Maria Lopez RATE 20 Case TITLE Secretary STORE La Cienega, Los Angeles "
+                         "lalisinghal36@example.com yes yes yes")
+    assert "I could not read: RATE 20 Case" in r
+    assert "```\nEMPLOYER Big Retail Co\nRATE 20\n" not in r and "EMPLOYER Big Retail Co" in r and "COVER yes yes yes" in r
+    assert say(A, "u", "@shiftreceipt hi").startswith("I could not read that.")

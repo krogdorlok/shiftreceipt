@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time as clock
 from collections import defaultdict
 from datetime import date, datetime, time, timezone
@@ -143,6 +144,9 @@ STEPS = [("name", "NAME your full name, e.g. NAME Maria Lopez"),
          ("manager", "MANAGER the email of the person who sets your schedule"),
          ("cover", COVER_TEXT)]
 CARDS = os.getenv("CARDS", "1") == "1"  # kill switch: the card schema is not verified against ASI:One
+EXAMPLES = {"name": "NAME Maria Lopez", "rate": "RATE 20", "employer": "EMPLOYER Big Retail Co",
+            "title": "TITLE Cashier", "store": "STORE Westwood, Los Angeles", "manager": "MANAGER manager@example.com",
+            "cover": "COVER yes yes yes"}
 TEXT_FIELDS = {"NAME": "name", "EMPLOYER": "employer", "TITLE": "title", "STORE": "store"}
 FOOTER = ("When did you get this schedule? If not today reply GOT YYYY-MM-DD. Fix with EDIT YYYY-MM-DD HH:MM-HH:MM "
           "or DROP YYYY-MM-DD. Then CONFIRM.")
@@ -180,7 +184,26 @@ def _missing(data: dict) -> list[str]:
 
 
 def _setup_prompt(missing: list[str]) -> str:
-    return "To set up, reply with:\n" + "\n".join(f"- {text}" for k, text in STEPS if k in missing)
+    example = "\n".join(EXAMPLES[k] for k, _ in STEPS if k in missing)
+    return ("To set up, reply with:\n" + "\n".join(f"- {text}" for k, text in STEPS if k in missing)
+            + "\n\nEach item starts with its keyword. Copy this, change the values, and send it:\n```\n"
+            + example + "\n```")
+
+
+MENTION = re.compile(r"^\s*(?:@\S+\s*)+")  # ASI:One puts "@agent1q... " in front of the text
+KEYWORDS = r"NAME|RATE|EMPLOYER|TITLE|STORE|MANAGER|COVER|GOT|EDIT|DROP|CONFIRM|RECEIPT|SEND|HELP|RESET|OT|Q\d{1,3}"
+
+
+def _normalize(text: str) -> str:
+    """Strip mentions; split a one-line message into one command per line (chat apps often drop newlines)."""
+    text = MENTION.sub("", text).strip()
+    if "\n" in text:
+        return text
+    if text.upper().startswith("SCHEDULE "):
+        return re.sub(r"\s+(?=\d{4}-\d{2}-\d{2}\b)", "\n", text)
+    if len(re.findall(rf"(?<!\S)(?:{KEYWORDS})(?=\s|$)", text)) > 1:  # uppercase keywords only
+        return re.sub(rf"\s+(?=(?:{KEYWORDS})(?:\s|$))", "\n", text)
+    return text
 
 
 def _sha_shifts(shifts: list[Shift]) -> str:
@@ -381,6 +404,16 @@ def handle_image(sender: str, data: bytes, mime: str) -> list[str]:
     return _new_version(sender, sha, shifts, warnings)
 
 
+def _saved(data: dict) -> str:
+    """What is saved so far, so a wrong value is visible; resending that one line replaces it."""
+    show = {"name": data.get("name"), "rate": data.get("rate") and usd(data["rate"]) + "/h",
+            "employer": data.get("employer"), "title": data.get("title"), "store": data.get("store"),
+            "manager": data.get("manager"),
+            "cover": data.get("cover") and " ".join("yes" if v else "no" for v in data["cover"].values())}
+    rows = [f"{k.upper()} {v}" for k, v in show.items() if v]
+    return "Saved so far (send a line again to change it):\n" + "\n".join(rows) if rows else "Saved."
+
+
 def _after_setup_field(sender: str, state: str) -> list[str]:
     data, _ = db.get_profile(DB_PATH, sender)
     read = []
@@ -389,13 +422,13 @@ def _after_setup_field(sender: str, state: str) -> list[str]:
             read += handle_image(sender, img[0], img[1])
         data, _ = db.get_profile(DB_PATH, sender)
     if m := _missing(data):
-        return ["Saved.\n" + _setup_prompt(m)]
+        return [_saved(data) + "\n\n" + _setup_prompt(m)]
     if state != "onboarding":
-        return ["Saved."] + read
+        return [_saved(data)] + read
     db.update_profile(DB_PATH, sender, state="ready")
     if v := _pending(sender, data):
-        return ["You are set up.\n\n" + _show(v)]
-    return ["You are set up. Send a screenshot of your schedule, or type it like this:\n\n" + SCHEDULE_EXAMPLE]
+        return [_saved(data) + "\n\nYou are set up.\n\n" + _show(v)]
+    return [_saved(data) + "\n\nYou are set up. Send a screenshot of your schedule, or type it like this:\n\n" + SCHEDULE_EXAMPLE]
 
 
 def run(sender: str, c) -> list[str]:
@@ -488,23 +521,29 @@ def _prose_send(text: str, c) -> list[str] | None:
 
 
 def handle_text(sender: str, text: str) -> list[str]:
-    """One command per message, or one per line when every line is a command (pasted onboarding)."""
+    """One command per message, or one per line (pasted setup). Lines that are not commands are named back."""
     text = text or ""
     if len(text) > 2000:  # never truncate: a cut paste can change a value (RATE 200 -> RATE 20)
         return ["That message is too long (2000 characters max). Please send it in parts."]
+    text = _normalize(text)
     lines = [l for l in text.splitlines() if l.strip()]
-    if len(lines) > 1 and lines[0].strip().upper() != "SCHEDULE" and all(cmds := [parse(l) for l in lines]):
-        out = []
-        for l, c in zip(lines, cmds):
-            out = _prose_send(l, c) or run(sender, c)
-        return out
+    if len(lines) > 1 and lines[0].strip().upper() != "SCHEDULE":
+        cmds = [parse(l) for l in lines]
+        if any(cmds):
+            out = []
+            for l, c in zip(lines, cmds):
+                if c:
+                    out = _prose_send(l, c) or run(sender, c)
+            bad = [l.strip()[:60] for l, c in zip(lines, cmds) if not c]
+            return out[:-1] + [out[-1] + "\n\nI could not read: " + "; ".join(bad)] if bad else out
     c = parse(text)
     if refused := _prose_send(text, c):
         return refused
     if not c:
         data, _ = db.get_profile(DB_PATH, sender)
-        m = _missing(data)
-        return [HELP_TEXT + ("\n\n" + _setup_prompt(m) if m else "")]
+        if m := _missing(data):
+            return ["I could not read that.\n" + _setup_prompt(m)]
+        return [HELP_TEXT]
     return run(sender, c)
 
 
