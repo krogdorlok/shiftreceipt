@@ -101,7 +101,7 @@ cp .env.example .env             # fill AGENT_SEED, GEMINI_API_KEY, RESEND_API_K
 - Images are never stored, only their sha256. Logs hold message ids, never message text or emails.
 - The signature photo is kept in memory only until that notice is sent, then dropped; never written to disk.
 - Every database query is filtered by sender. RESET works only for demo accounts.
-- Email goes only to the manager address the worker set, only after `SEND <id>`, at most 2 per day.
+- Email goes only to the manager address the worker set, only after the worker signs and types `SEND 1`, at most 2 per day.
 
 ## Limitations
 
