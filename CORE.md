@@ -12,7 +12,7 @@ Run: `python3 -m pip install -r requirements.txt && python3 -m pytest -q`
 | fixtures/ | v1, v2, v3 demo week Oct 19-25 2026 | T1 draws the screenshots to match |
 
 Golden demo (test_demo_receipt_matches_pitch): v1 learned Oct 4, v2 learned Oct 18, $20/h ->
-Tue moved $20, Thu 3 h cut $30, Sun 2 h added $20, Sat clopening $80 = $150. v3 cancels Sunday: +$80.
+Tue moved $20, Thu 3 h cut $30, Sun 2 h added $20, Sat clopening $80 = $150 ($70 schedule-change pay now, $80 rest premium only if Sat is worked). v3 cancels Sunday: +$80.
 
 Still to build (one builder, see ShiftReceipt_ONE_LAPTOP.md): agent.py, extract.py, notice.py.
 Agent flow: ack -> first_time(msg_id) -> parse or image -> state machine in db -> diff consecutive

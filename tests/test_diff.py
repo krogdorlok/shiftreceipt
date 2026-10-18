@@ -48,6 +48,10 @@ def test_moved_to_other_day_same_week_is_one_event():
     assert [e.kind for e in ev] == ["moved"] and ev[0].day == date(2026, 10, 20)
 
 
+def test_moved_to_other_day_new_hours_same_week_needs_review():
+    assert kinds([S("2026-10-20", "09:00", "17:00")], [S("2026-10-22", "09:00", "14:00")]) == ["needs_review"] * 2
+
+
 def test_moved_to_next_week_is_cancel_plus_add():
     assert sorted(kinds([S("2026-10-23", "09:00", "17:00")], [S("2026-10-27", "09:00", "17:00")])) == ["added", "cancelled"]
 
@@ -81,3 +85,9 @@ def test_nearest_date_year_wrap():
     assert nearest_date(12, 30, date(2027, 1, 2)) == date(2026, 12, 30)
     assert nearest_date(10, 20, date(2026, 10, 18)) == date(2026, 10, 20)
     assert nearest_date(2, 29, date(2027, 3, 1)) == date(2028, 2, 29)
+
+
+def test_two_days_with_moved_starts_in_one_week_need_review_end_only_changes_stay_priced():
+    base = [S("2026-10-19", "09:00", "17:00"), S("2026-10-20", "09:00", "17:00"), S("2026-10-21", "09:00", "17:00")]
+    new = [S("2026-10-19", "10:00", "17:00"), S("2026-10-20", "11:00", "17:00"), S("2026-10-21", "09:00", "13:00")]
+    assert kinds(base, new) == ["needs_review", "needs_review", "hours_cut"]
