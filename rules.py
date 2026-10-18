@@ -35,7 +35,8 @@ def is_late(e: ChangeEvent) -> bool:
 
 
 def _loc_changed(old: Shift, new: Shift) -> bool:
-    return bool(old.location and new.location) and old.location.strip().lower() != new.location.strip().lower()
+    a, b = (old.location or "").strip().lower(), (new.location or "").strip().lower()
+    return bool(a and b) and a != b
 
 
 def changes(e: ChangeEvent) -> int:

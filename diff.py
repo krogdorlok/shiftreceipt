@@ -54,17 +54,17 @@ def diff(prev: ScheduleVersion, curr: ScheduleVersion) -> list[ChangeEvent]:
         elif news:
             added.append(news[0])
 
-    # A shift that moved to another day in the same week is one "moved" event, not cancel + add.
-    for old in list(removed):
-        match = next((n for n in added if n.minutes() == old.minutes()
-                      and n.day.isocalendar()[:2] == old.day.isocalendar()[:2]), None)
-        if match:
-            removed.remove(old)
-            added.remove(match)
-            add(min(old.day, match.day), "moved", old, match)
-    # Left over in one week: maybe a move to another day with different hours (City FAQ counts that as one
-    # change, cancel + add would overpay). The pairing is a guess, so mark those days for review.
+    # A shift moved to another day in the same week is one "moved" event, not cancel + add, but only when the
+    # pairing is certain: exactly one shift left the week and one arrived, same length.
     wk = lambda s: s.day.isocalendar()[:2]
+    for w in {wk(o) for o in removed} & {wk(n) for n in added}:
+        olds, news = [o for o in removed if wk(o) == w], [n for n in added if wk(n) == w]
+        if len(olds) == len(news) == 1 and olds[0].minutes() == news[0].minutes():
+            removed.remove(olds[0])
+            added.remove(news[0])
+            add(min(olds[0].day, news[0].day), "moved", olds[0], news[0])
+    # Still both in one week: a move with new hours (FAQ: one change) or several moves. Any pairing is a guess
+    # and cancel + add would overpay, so mark those days for review.
     both = {wk(o) for o in removed} & {wk(n) for n in added}
     for old in removed:
         add(old.day, "needs_review" if wk(old) in both else "cancelled", old=old)
