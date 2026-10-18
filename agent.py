@@ -34,8 +34,8 @@ class DownloadError(Exception):
 
 
 def download(url: str, transport: httpx.BaseTransport | None = None) -> tuple[bytes, str]:
-    if urlparse(url).scheme not in ("http", "https"):
-        raise DownloadError("scheme not allowed")
+    if not _http(url):
+        raise DownloadError("bad or non-http url")
     deadline = time.monotonic() + TIMEOUT_S
     try:
         with httpx.Client(timeout=TIMEOUT_S, follow_redirects=True, transport=transport) as client:
@@ -62,7 +62,10 @@ def download(url: str, transport: httpx.BaseTransport | None = None) -> tuple[by
 
 
 def _http(u) -> bool:
-    return isinstance(u, str) and urlparse(u).scheme in ("http", "https")
+    try:
+        return isinstance(u, str) and urlparse(u).scheme in ("http", "https") and bool(urlparse(u).hostname)
+    except ValueError:  # e.g. "http://[bad"
+        return False
 
 
 def image_url(item: ResourceContent) -> str | None:
