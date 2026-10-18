@@ -1,9 +1,8 @@
 VERDICT: FAIL
-Milestone: M2   Round: 1   Tests: 3 failed, 126 passed in 0.81s
+Milestone: M2   Round: 2   Tests: 2 failed, 129 passed in 4.30s
 ## Findings
-1. [MAJOR] extract.py:103  Empty Gemini shifts return no warning, so a non-schedule image prints a bare SCHEDULE block instead of the required unreadable fallback. Return ([], ["unreadable"]) when no rows are extracted. Test: tests/review/test_m2_1.py
-2. [MAJOR] extract.py:37  Missing ambiguous defaults to False, accepting a row without the required uncertainty flag as a definite shift. Require the field so malformed output falls back as unreadable. Test: tests/review/test_m2_2.py
-3. [MAJOR] extract.py:53  The interactions request omits response_mime_type, which the installed SDK requires with response_format; the TypeError fallback can fail instead of extracting shifts. Pass response_mime_type="application/json" alongside the schema. Test: tests/review/test_m2_3.py
+1. [MAJOR] extract.py:90  Identical Gemini rows become duplicate shifts; diff.py then marks a real changed day needs_review and can suppress its pay line. Deduplicate identical shifts before returning. Test: tests/review/test_m2_4.py
+2. [MAJOR] extract.py:45  The installed Interactions SDK retries 5xx internally, so its fallback made four HTTP requests despite M2's one-retry limit. Set HttpRetryOptions(attempts=1) on the client and keep the explicit retry loop. Test: tests/review/test_m2_5.py
 ## Invariants
 1-8: OK
 ## Disputed tests
