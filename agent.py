@@ -210,16 +210,25 @@ def _events(sender: str):
     """Each work week is compared only with earlier schedules that cover the same week."""
     # ponytail: a schedule with no shifts at all in a week cannot say "week cancelled"; screenshots never do
     vs = db.versions(DB_PATH, sender)
+    covers = _covers(sender, vs)
     events = []
-    for w in sorted({_week(s.day) for v in vs for s in v.shifts}):
-        cover = [_in_week(v, w) for v in vs if any(_week(s.day) == w for s in v.shifts)]
+    for w in sorted(set().union(*covers.values()) if covers else set()):
+        cover = [_in_week(v, w) for v in vs if w in covers[v.id]]
         events += [e for a, b in zip(cover, cover[1:]) for e in diff(a, b)]
     return vs, sorted(events, key=lambda e: (e.day, e.id))
 
 
+def _covers(sender: str, vs) -> dict:
+    """Weeks each version covers, as uploaded (saved then), so dropping every shift of a week still cancels it."""
+    data, _ = db.get_profile(DB_PATH, sender)
+    saved = data.get("weeks", {})
+    return {v.id: {tuple(w) for w in saved.get(str(v.id), [])} | {_week(s.day) for s in v.shifts} for v in vs}
+
+
 def _current_shifts(vs) -> list[Shift]:
     """Latest known shifts for every week (versions are in learned order)."""
-    latest = {_week(s.day): v for v in vs for s in v.shifts}
+    covers = _covers(vs[0].sender, vs) if vs else {}
+    latest = {w: v for v in vs for w in covers[v.id]}
     return [s for w, v in latest.items() for s in v.shifts if _week(s.day) == w]
 
 
@@ -317,7 +326,9 @@ def _new_version(sender: str, sha: str, shifts: list[Shift], warnings: list[str]
     if (known := _known(sender, sha)) is not None:
         return known
     vid, _ = db.add_version(DB_PATH, sender, sha, shifts)
-    db.update_profile(DB_PATH, sender, pending_vid=vid)
+    data, _ = db.get_profile(DB_PATH, sender)
+    db.update_profile(DB_PATH, sender, pending_vid=vid,
+                      weeks={**data.get("weeks", {}), str(vid): sorted({_week(s.day) for s in shifts})})
     data, _ = db.get_profile(DB_PATH, sender)
     if m := _missing(data):
         return ["Saved your schedule. I will show it once you are set up.\n" + _setup_prompt(m)]
@@ -440,18 +451,27 @@ def welcome(sender: str) -> str:
     return "Welcome back. Send your newest schedule, or RECEIPT to see your receipt."
 
 
+def _prose_send(text: str, c) -> list[str] | None:
+    """Invariant 4: only a typed SEND <id> or a card click sends; prose like "do not send receipt 7" never does."""
+    if c and c.name == "SEND" and not (_strict(text) or _from_json(text)):
+        return [f"To email notice {c.args['id']}, type SEND {c.args['id']}."]
+    return None
+
+
 def handle_text(sender: str, text: str) -> list[str]:
     """One command per message, or one per line when every line is a command (pasted onboarding)."""
-    text = (text or "")[:2000]  # same cap as parser.parse, for the whole paste
-    lines = [l for l in (text or "").splitlines() if l.strip()]
+    text = text or ""
+    if len(text) > 2000:  # never truncate: a cut paste can change a value (RATE 200 -> RATE 20)
+        return ["That message is too long (2000 characters max). Please send it in parts."]
+    lines = [l for l in text.splitlines() if l.strip()]
     if len(lines) > 1 and lines[0].strip().upper() != "SCHEDULE" and all(cmds := [parse(l) for l in lines]):
         out = []
-        for c in cmds:
-            out = run(sender, c)
+        for l, c in zip(lines, cmds):
+            out = _prose_send(l, c) or run(sender, c)
         return out
     c = parse(text)
-    if c and c.name == "SEND" and not (_strict(text) or _from_json(text)):  # prose like "do not send receipt 7"
-        return [f"To email notice {c.args['id']}, type SEND {c.args['id']}."]
+    if refused := _prose_send(text, c):
+        return refused
     if not c:
         data, _ = db.get_profile(DB_PATH, sender)
         m = _missing(data)
