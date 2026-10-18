@@ -135,9 +135,21 @@ DEMO_SENDERS = {s.strip() for s in os.getenv("DEMO_SENDERS", "").split(",") if s
 PENDING_IMAGES: dict[str, list[tuple[bytes, str, str]]] = defaultdict(list)
 LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # one message at a time per sender
 
-COVER_TEXT = ("Three yes/no questions: (1) Is your employer a retail business? (2) Does it have 300+ employees "
-              "worldwide? (3) Is your store inside the City of Los Angeles (not Santa Monica, Culver City, Burbank, "
-              "Glendale, Beverly Hills, Pasadena) and do you work 2+ hours a week there? Reply e.g. COVER yes yes yes")
+COVER_TEXT = ("COVER: three yes/no answers, in this order:  \n"
+              "(1) Is your employer a retail business?  \n"
+              "(2) Does your employer have 300 or more employees worldwide?  \n"
+              "(3) Do you work 2 or more hours a week at a store inside the City of Los Angeles? (Santa Monica, "
+              "Culver City, Burbank, Glendale, Beverly Hills and Pasadena are separate cities.)  \n"
+              "Reply e.g. COVER yes yes yes")
+GREETING = ("**Hi, I am ShiftReceipt.** I help retail workers in the City of Los Angeles check last minute schedule "
+            "changes under the Fair Work Week Ordinance, and see what predictability pay may be owed. Not legal advice."
+            "\n\n**How it works**  \n"
+            "1. Set up once: send your details (I show you exactly what to send).  \n"
+            "2. Send a screenshot of the schedule you were given, or type it.  \n"
+            "3. Tell me the day you got it (GOT YYYY-MM-DD), then reply CONFIRM.  \n"
+            "4. When your schedule changes, send the new one the same way and answer a few yes/no questions.  \n"
+            "5. I show a receipt. If pay may be owed, SEND 1 emails the official notice to your manager.")
+NOTICE_ALIAS = 1  # the worker always types SEND 1: it means "my current notice", whatever its row id is
 STEPS = [("name", "NAME your full name, e.g. NAME Maria Lopez"),
          ("rate", "RATE your hourly pay, e.g. RATE 20"),
          ("employer", "EMPLOYER the company you work for"),
@@ -225,11 +237,21 @@ def _show(v, warnings: list[str] = ()) -> str:
     return "\n".join(out + ["", FOOTER])
 
 
+def _range(s: Shift, day: bool = False) -> str:
+    return (f"{_d(s.day)} " if day else "") + f"{_t(s.start)}-{_t(s.end)}"
+
+
 def _describe(e) -> str:
-    what = KIND_WORDS[e.kind]
+    """'Tue Oct 20, shift moved: from 9:00 AM-5:00 PM to 1:00 PM-9:00 PM' (day shown only if it changed)."""
+    head = f"**{_d(e.day)}, {KIND_WORDS[e.kind]}**"
     if e.old and e.new:
-        return f"{what} from {_shift(e.old)} to {_shift(e.new)}"
-    return f"{what} ({_shift(e.old or e.new)})" if (e.old or e.new) else what
+        other_day = e.old.day != e.new.day
+        return f"{head}: from {_range(e.old, other_day)} to {_range(e.new, other_day)}"
+    if e.new:
+        return f"{head}: new shift {_range(e.new)}"
+    if e.old:
+        return f"{head}: your {_range(e.old)} shift was removed"
+    return f"{head}: the shifts on this day changed in a way I cannot price"
 
 
 def _week(d: date):
@@ -267,11 +289,17 @@ def _current_shifts(vs) -> list[Shift]:
 
 
 def _ask(events, qs: dict) -> str:
+    """Questions grouped under the change they are about."""
     by_id = {e.id: e for e in events}
-    out = ["A few questions about each change. Reply to each, e.g. Q1 no."]
+    out = ["**A few yes/no questions about these changes.** Answer all at once, for example: "
+           + " ".join(f"Q{n} no" for n in qs)]
+    last = None
     for n, (eid, field) in qs.items():
-        e = by_id.get(eid)
-        out.append(f"Q{n} {_d(e.day)}, {_describe(e)}: {QUESTIONS[field]}" if e else f"Q{n} {QUESTIONS[field]}")
+        if eid != last:
+            e = by_id.get(eid)
+            out.append("\n" + (_describe(e) if e else "**Earlier change**") + "  ")
+            last = eid
+        out.append(f"Q{n} {QUESTIONS[field]}  ")
     return "\n".join(out)
 
 
@@ -301,26 +329,30 @@ def receipt(sender: str) -> list[str]:
     lines = (rules.evaluate(events, db.get_answers(DB_PATH, sender), cov, data["rate"])
              + rules.rest_lines(_current_shifts(vs), cov, data["rate"], ot))
     by_id = {e.id: e for e in events}
-    out, saved = ["Your schedule receipt:"], []
+    out, saved = ["**Your schedule receipt**", ""], []
     if len(vs) == 1:
-        out.append("This is your first schedule, so I saved it as a baseline. Only the rest rule applies until a "
-                   "changed schedule arrives.")
+        out += ["This is your first schedule, so I saved it as a baseline. Only the rest rule applies until a "
+                "changed schedule arrives.", ""]
     for l in lines:
         e = by_id.get(l.event_id)
         day = e.day if e else date.fromisoformat(l.event_id.removeprefix("rest-"))
         what = KIND_WORDS[e.kind] if e else "under 10 hours rest"
-        status = ("may be owed" + (" if you work it" if l.rule == "R6" and day >= _today() else "")
-                  if l.status == "may_be_owed" else f"{l.status.replace('_', ' ')}: {l.explanation}")
-        out.append(f"{_d(day)} | {what} | {usd(l.cents)} | {status} | {l.citation}")
+        text = _describe(e) if e else f"**{_d(day)}, {what}**: this shift starts too soon after your last one"
+        if l.status == "may_be_owed":
+            amount = f"**{usd(l.cents)} may be owed" + (" if you work it" if l.rule == "R6" and day >= _today()
+                                                        else "") + "**"
+        else:
+            amount = f"**$0.00**, {l.status.replace('_', ' ')}: {l.explanation[0].lower()}{l.explanation[1:]}"
+        out.append(f"{text}. {amount}. _{l.citation}_  ")
         saved.append({**l.model_dump(), "day": day.isoformat(), "change": what})
     if not lines:
         out.append("No changes found between your schedules.")
     sched, rest, tot = rules.total(lines, PAY_RULES), rules.total(lines, {"R6"}), rules.total(lines)
-    out += [f"Schedule change pay that may be owed: {usd(sched)}"]
+    out += ["", f"**Schedule change pay that may be owed: {usd(sched)}**  "]
     if rest:
-        out += [f"Rest premium that may be owed, only for shifts you actually work: {usd(rest)}"]
+        out += [f"Rest premium that may be owed, only for shifts you actually work: {usd(rest)}  "]
     out += [f"Estimated total: {usd(tot)}. This is an estimate, not unpaid wages yet: predictability pay is due on "
-            "the payday for the pay period of the change.", rules.NOT_CHECKED, "Questions: OWS (844) 924-3752"]
+            "the payday for the pay period of the change.", "", f"_{rules.NOT_CHECKED} Questions: OWS (844) 924-3752_"]
     due = rules.due_lines(lines, datetime.now(LA), _current_shifts(vs))
     if due:
         # ponytail: a new pending notice per receipt; claim_notice's daily cap limits what can actually be sent
@@ -328,13 +360,13 @@ def receipt(sender: str) -> list[str]:
         due_saved = [s for s in saved if s["event_id"] in keep]
         nid = db.create_notice(DB_PATH, sender, due_saved, rules.total(due))
         db.update_profile(DB_PATH, sender, notice={"id": nid, "lines": due_saved, "day": _today().isoformat()})
-        card = _card(nid, rules.total(due), data["manager"])
-        out += ["", f"Notice preview ({nid}): {data['employer']} may owe {data['name']} {usd(rules.total(due))} "
+        card = _card(NOTICE_ALIAS, rules.total(due), data["manager"])
+        out += ["", f"**Notice preview:** {data['employer']} may owe {data['name']} **{usd(rules.total(due))}** "
                     "under the LA Fair Work Week Ordinance for:"]
-        out += [f"- {s['day']} {s['change']}: {usd(s['cents'])}" for s in saved if s["event_id"] in keep]
-        out += ["", "Check your paycheck for that pay period first. If the pay is missing, reply SEND "
-                f"{nid} to email the official Notice to Cure to {data['manager']}. Your employer then has 15 days "
-                "from receiving it to fix this."]
+        out += [f"- {_d(date.fromisoformat(s['day']))}, {s['change']}: {usd(s['cents'])}" for s in due_saved]
+        out += ["", "**Next step:** check your paycheck for that pay period first. If the pay is missing, reply SEND "
+                f"{NOTICE_ALIAS} to email the official Notice to Cure to {data['manager']}. Your employer then has "
+                "15 days from receiving it to fix this."]
     elif tot:
         out += ["", "Nothing to claim yet: the rest premium is only owed once you work that shift. Reply RECEIPT "
                     "after you work it."]
@@ -510,11 +542,19 @@ def run(sender: str, c) -> list[str]:
     return [HELP_TEXT]
 
 
+def first_contact(sender: str) -> bool:
+    """True once per worker (again after RESET): ASI:One does not always send a start-session message."""
+    data, _ = db.get_profile(DB_PATH, sender)
+    if data.get("greeted"):
+        return False
+    db.update_profile(DB_PATH, sender, greeted=True)
+    return True
+
+
 def welcome(sender: str) -> str:
     data, _ = db.get_profile(DB_PATH, sender)
     if m := _missing(data):
-        return ("Hi, I am ShiftReceipt. I check LA Fair Work Week schedule changes and show what may be owed. "
-                "Not legal advice.\n" + _setup_prompt(m))
+        return GREETING + "\n\n" + _setup_prompt(m)
     return "Welcome back. Send your newest schedule, or RECEIPT to see your receipt."
 
 
@@ -531,14 +571,14 @@ def _hint(sender: str, data: dict, text: str) -> str:
         out.append(f"Did you mean: {' '.join([guess[0]] + words[1:])}")
     notice = data.get("notice") or {}
     still = _open(sender, data.get("questions", {}))
-    if notice and text.strip() == str(notice.get("id")):
-        out.append(f"To email notice {notice['id']}, type SEND {notice['id']}.")
+    if notice and text.strip() == str(NOTICE_ALIAS):
+        out.append(f"To email your notice, type SEND {NOTICE_ALIAS}.")
     elif still:
         out.append(f"Open questions: {', '.join('Q' + k for k in still)}. Reply e.g. Q{next(iter(still))} no.")
     elif _pending(sender, data):
         out.append(FOOTER)
     elif notice:
-        out.append(f"To email notice {notice['id']}, type SEND {notice['id']}. RECEIPT shows the receipt again.")
+        out.append(f"To email your notice, type SEND {NOTICE_ALIAS}. RECEIPT shows the receipt again.")
     else:
         out.append("Send a new schedule screenshot, or RECEIPT to see your receipt. HELP explains everything.")
     return "\n".join(out)
@@ -573,7 +613,8 @@ def handle_text(sender: str, text: str) -> list[str]:
     if not c:
         data, _ = db.get_profile(DB_PATH, sender)
         if m := _missing(data):
-            return ["I could not read that.\n" + _setup_prompt(m)]
+            started = any(data.get(k) for k, _ in STEPS)
+            return [("I could not read that.\n" if started else "") + _setup_prompt(m)]
         return [_hint(sender, data, text)]
     return run(sender, c)
 
@@ -582,9 +623,12 @@ def send_notice(sender: str, nid: int) -> list[str]:
     """Only the latest notice preview, only for its owner, only once (db.claim_notice is atomic and capped)."""
     data, _ = db.get_profile(DB_PATH, sender)
     pending = data.get("notice") or {}
-    if pending.get("id") == nid and pending.get("day") != _today().isoformat():
+    if nid != NOTICE_ALIAS or not pending:
+        return ["That notice is not pending or the daily limit is reached."]
+    if pending.get("day") != _today().isoformat():
         return ["That preview is from an earlier day. Reply RECEIPT for a fresh one."]
-    if pending.get("id") != nid or not db.claim_notice(DB_PATH, sender, nid):
+    nid = pending["id"]  # SEND 1 = this worker's current notice
+    if not db.claim_notice(DB_PATH, sender, nid):
         return ["That notice is not pending or the daily limit is reached."]
     now = datetime.now(LA)
     note = "Schedules: " + "; ".join(
@@ -605,7 +649,7 @@ def send_notice(sender: str, nid: int) -> list[str]:
         missing = [] if os.getenv("RESEND_API_KEY") else [k for k in ("SMTP_USER", "SMTP_APP_PASSWORD") if not os.getenv(k)]
         logging.getLogger("shiftreceipt").error(
             f"notice {nid} not sent: step={step} error={type(e).__name__} code={code} missing_env={missing}")
-        return [f"Not sent. Try SEND {nid} again."]
+        return [f"Not sent. Try SEND {NOTICE_ALIAS} again."]
     db.finish_notice(DB_PATH, sender, nid, mid)
     return [f"Sent {_t(now.time())} to {data['manager']}. Your employer has 15 calendar days from receiving it to "
             f"fix this (until {_d(rules.cure_deadline(now))} if they receive it today). If not, you can file a "
@@ -622,6 +666,9 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         if not await asyncio.to_thread(db.first_time, DB_PATH, f"{sender}:{msg.msg_id}"):
             return
         ctx.logger.info(f"msg {msg.msg_id} from {sender[:16]} items={len(msg.content)}")
+        starts = any(isinstance(i, StartSessionContent) for i in msg.content)
+        if await asyncio.to_thread(first_contact, sender) and not starts:
+            await reply(ctx, sender, GREETING)
         for item in msg.content:
             try:
                 await handle_item(ctx, sender, item)
@@ -635,6 +682,7 @@ async def handle_item(ctx: Context, sender: str, item) -> None:
         await ctx.send(sender, ChatMessage(timestamp=_now(), msg_id=uuid4(),
                                            content=[MetadataContent(type="metadata",
                                                                     metadata={"attachments": "true"})]))
+        await asyncio.to_thread(first_contact, sender)
         await reply(ctx, sender, await asyncio.to_thread(welcome, sender))
     elif isinstance(item, ResourceContent):
         url = image_url(item)

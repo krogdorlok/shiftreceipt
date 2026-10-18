@@ -60,20 +60,22 @@ def golden(A, sender, upto=None):
 
 def test_golden_script(A):
     r = golden(A, "maria")
+    assert r[0].startswith("**Hi, I am ShiftReceipt.**") and "How it works" in r[0]  # greeting on first message
     assert "To set up" in r[0] and "NAME" not in r[0].split("To set up")[1] and "RATE" in r[0]
-    assert "Three yes/no questions" in r[5]
+    assert "COVER: three yes/no answers" in r[5] and "(3) Do you work 2 or more hours" in r[5] and "(4)" not in r[5]
     assert "Tue Oct 20 9:00 AM-5:00 PM Westwood" in r[7] and "CONFIRM" in r[7]
     assert "baseline" in r[9]
     qs = re.findall(r"^Q\d+ ", r[12], re.M)
     assert len(qs) == 5 and "Did you ask for this change?" in r[12]
     final = r[-1]
-    assert "Tue Oct 20 | shift moved | $20.00 | may be owed" in final
-    assert "Thu Oct 22 | hours cut | $30.00 | may be owed" in final
-    assert "Sun Oct 25 | hours added | $20.00 | may be owed" in final
-    assert "Sat Oct 24 | under 10 hours rest | $80.00" in final
+    assert "**Tue Oct 20, shift moved**: from 9:00 AM-5:00 PM to 1:00 PM-9:00 PM. **$20.00 may be owed**" in final
+    assert "**Thu Oct 22, hours cut**: from 12:00 PM-6:00 PM to 12:00 PM-3:00 PM. **$30.00 may be owed**" in final
+    assert "**Sun Oct 25, hours added**: from 10:00 AM-4:00 PM to 10:00 AM-6:00 PM. **$20.00 may be owed**" in final
+    assert "**Sat Oct 24, under 10 hours rest**" in final and "**$80.00 may be owed if you work it**" in final
+    assert "**Notice preview:** Big Retail Co may owe Maria Lopez **$70.00**" in final
     assert "Schedule change pay that may be owed: $70.00" in final
     assert "Estimated total: $150.00" in final
-    assert re.search(r"reply SEND \d+ to email the official Notice to Cure to boss@example.com", final)
+    assert "reply SEND 1 to email the official Notice to Cure to boss@example.com" in final
     assert "Not legal advice" in final and "—" not in final and "you are owed" not in final.lower()
 
 
@@ -168,7 +170,7 @@ def test_next_week_is_not_a_change_and_edited_reupload_is_new(A):
 
 def test_prose_send_is_not_a_send(A):
     assert "type SEND 7" in say(A, "u", "Please send receipt 7")
-    assert "could not read" in say(A, "u", "Do not send receipt 7")  # negated: not a command at all
+    assert "To set up" in say(A, "u", "Do not send receipt 7")  # negated: not a command at all
 
 
 def test_stale_preview_needs_fresh_receipt(A):
@@ -227,7 +229,28 @@ def test_missing_keywords_get_a_copyable_block(A):
 
 def test_unreadable_text_gets_a_hint_for_where_you_are(A):
     nid = re.search(r"reply SEND (\d+)", golden(A, "maria")[-1])[1]
-    assert f"To email notice {nid}, type SEND {nid}." in say(A, "maria", AT + nid)
+    assert "To email your notice, type SEND 1." in say(A, "maria", AT + nid)
     assert f"Did you mean: SEND {nid}" in say(A, "maria", f"SNED {nid}")
     say(A, "maria", schedule_text(fixture("v3")))
     assert "Then CONFIRM" in say(A, "maria", "ok")
+
+
+def test_send_number_is_always_1(A, monkeypatch):
+    import notice
+    sent = []
+    monkeypatch.setattr(notice, "send", lambda to, pdf, name: sent.append(to) or "<m>")
+    monkeypatch.setattr(A, "DEMO_SENDERS", {"maria", "bob"})
+    for run in range(3):  # three demo runs, two users: always SEND 1
+        for who in ("maria", "bob"):
+            assert "reply SEND 1 to email" in golden(A, who)[-1]
+        assert say(A, "maria", "SEND 1").startswith("Sent")
+        assert "not pending" in say(A, "maria", "SEND 1") and "not pending" in say(A, "maria", "SEND 2")
+        assert "Reset done" in say(A, "maria", "RESET") and "Reset done" in say(A, "bob", "RESET")
+    assert len(sent) == 3
+
+
+def test_first_message_gets_greeting_and_steps(A):
+    r = say(A, "new", "hi")
+    assert r.startswith("**Hi, I am ShiftReceipt.**") and "1. Set up once" in r and "5. I show a receipt" in r
+    assert "To set up" in r and "could not read" not in r
+    assert "Hi, I am ShiftReceipt" not in say(A, "new", "NAME Ana")  # only once
